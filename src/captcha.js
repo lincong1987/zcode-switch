@@ -18,6 +18,10 @@ function detail(text) {
   $detail.textContent = text || "";
 }
 
+document.addEventListener("securitypolicyviolation", (e) => {
+  detail(`CSP 拦截 ${e.violatedDirective} ← ${String(e.blockedURI).slice(0, 70)}`);
+});
+
 function loadSdk() {
   return new Promise((resolve, reject) => {
     if (typeof window.initAliyunCaptcha === "function") return resolve();
@@ -70,11 +74,12 @@ async function run() {
     });
   };
 
-  const interactive = () => {
+  const interactive = (why) => {
     clearTimeout(tracelessTimer);
     status("需要人工验证，请点击下方按钮");
     $btn.hidden = false;
     $btn.focus();
+    if (why) detail(typeof why === "string" ? why.slice(0, 120) : JSON.stringify(why).slice(0, 120));
   };
 
   try {
@@ -94,8 +99,8 @@ async function run() {
         }
       },
       success: (param) => submit(typeof param === "string" ? param : param?.captchaVerifyParam),
-      fail: () => interactive(),
-      onError: () => interactive(),
+      fail: (p) => interactive(p),
+      onError: (p) => interactive(p),
     });
   } catch (e) {
     status("验证码初始化失败", "err");
