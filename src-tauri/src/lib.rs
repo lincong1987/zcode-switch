@@ -1,0 +1,904 @@
+pub mod cipher;
+pub mod cli;
+mod claim;
+mod oauth;
+mod quota;
+mod store;
+mod zcrypto;
+
+use serde_json::{json, Value};
+use std::sync::Mutex;
+use store::*;
+use tauri::menu::{MenuBuilder, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_autostart::AutoLaunchManager;
+use tauri_plugin_dialog::DialogExt;
+
+const TRAY_ID: &str = "main";
+
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+struct PendingClaim {
+    account_id: String,
+    account_name: String,
+    plan_id: String,
+    plan_name: String,
+    credentials: Value,
+    config: Option<Value>,
+    device_mid: String,
+}
+
+static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
+
+fn pending_guard() -> std::sync::MutexGuard<'static, Option<PendingClaim>> {
+    match PENDING_CLAIM.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+    match STORE_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+fn tray_menu_inner(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    let paths = Paths::detect();
+    let state = match store::get_state(&paths) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("tray state error: {e}");
+            return MenuBuilder::new(app)
+                .item(&MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?)
+                .item(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)
+                .build();
+        }
+    };
+
+    let b = MenuBuilder::new(app)
+        .item(&MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?)
+        .item(&MenuItem::with_id(app, "capture", "保存当前登录", state.live_logged_in, None::<&str>)?)
+        .separator()
+        .item(&MenuItem::with_id(app, "launch", "启动 ZCode", state.zcode_path_ok && !state.zcode_running, None::<&str>)?)
+        .item(&MenuItem::with_id(app, "kill", "关闭 ZCode", state.zcode_running, None::<&str>)?)
+        .separator()
+        .item(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?);
+    b.build()
+}
+
+pub fn rebuild_tray(app: &AppHandle) {
+    let app2 = app.clone();
+    let res = app.run_on_main_thread(move || {
+        if let Some(tray) = app2.tray_by_id(TRAY_ID) {
+            let paths = Paths::detect();
+            let tip = match store::get_state(&paths) {
+                Ok(s) => {
+                    let cur = s
+                        .accounts
+                        .iter()
+                        .find(|a| a.is_active)
+                        .map(|a| a.name.clone())
+                        .or_else(|| s.live_identity.as_ref().and_then(|i| i.label()))
+                        .unwrap_or_else(|| if s.live_logged_in { "未保存的登录".into() } else { "未登录".into() });
+                    format!("Z·SWITCH · {cur}")
+                }
+                Err(_) => "Z·SWITCH".into(),
+            };
+            let _ = tray.set_tooltip(Some(&tip));
+            if let Ok(menu) = tray_menu_inner(&app2) {
+                let _ = tray.set_menu(Some(menu));
+            }
+        }
+    });
+    if let Err(e) = res {
+        eprintln!("rebuild_tray: {e}");
+    }
+}
+
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+fn run_tray_action(app: AppHandle, action: String) {
+    std::thread::spawn(move || {
+        let paths = Paths::detect();
+        let mut emit_payload = json!({ "action": action });
+        let _guard = store_guard();
+        let result: Result<serde_json::Value, String> = match action.as_str() {
+            "capture" => store::capture_current(&paths, None).map(|a| json!({ "name": a.name })),
+            "launch" => {
+                let (p, ok) = effective_zcode_path(&paths);
+                if ok { store::launch_zcode(&p).map(|_| json!({})) } else { Err(format!("ZCode 路径无效：{p}")) }
+            }
+            "kill" => match store::kill_zcode() {
+                Ok(true) => Ok(json!({})),
+                Ok(false) => Err("关闭 ZCode 超时".into()),
+                Err(e) => Err(e),
+            },
+            _ => Ok(json!({})),
+        };
+        match result {
+            Ok(v) => {
+                emit_payload["ok"] = json!(true);
+                emit_payload["result"] = v;
+            }
+            Err(e) => {
+                emit_payload["ok"] = json!(false);
+                emit_payload["error"] = json!(e);
+            }
+        }
+        let _ = app.emit("tray-action", &emit_payload);
+        rebuild_tray(&app);
+    });
+}
+
+#[tauri::command]
+async fn get_state() -> Result<AppState, String> {
+    store::get_state(&Paths::detect())
+}
+
+#[tauri::command]
+async fn capture_current(app: AppHandle, name: Option<String>) -> Result<Account, String> {
+    let _guard = store_guard();
+    let r = store::capture_current(&Paths::detect(), name);
+    rebuild_tray(&app);
+    r
+}
+
+#[tauri::command]
+async fn rename_account(app: AppHandle, id: String, name: String) -> Result<Account, String> {
+    let _guard = store_guard();
+    let r = store::rename_account(&Paths::detect(), &id, &name);
+    rebuild_tray(&app);
+    r
+}
+
+#[tauri::command]
+async fn delete_account(app: AppHandle, id: String) -> Result<(), String> {
+    let _guard = store_guard();
+    let r = store::delete_account(&Paths::detect(), &id);
+    rebuild_tray(&app);
+    r
+}
+
+#[tauri::command]
+async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account, String> {
+    let _guard = store_guard();
+    let r = store::update_account_from_live(&Paths::detect(), &id);
+    rebuild_tray(&app);
+    r
+}
+
+#[tauri::command]
+async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Result<SwitchResult, String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    let hot = load_settings(&paths).hot_switch();
+    let r = store::switch_to(&paths, &id, force, restart, hot);
+    rebuild_tray(&app);
+    r
+}
+
+#[tauri::command]
+async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
+    store::live_quota(&Paths::detect())
+}
+
+#[tauri::command]
+async fn get_account_quota(id: String) -> Result<quota::QuotaOverview, String> {
+    store::account_quota(&Paths::detect(), &id)
+}
+
+#[tauri::command]
+async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
+    let paths = Paths::detect();
+    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+    let acc = load_account(&paths, &id)?;
+    claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+}
+
+#[tauri::command]
+async fn claim_start(app: AppHandle, id: String, plan_id: String) -> Result<serde_json::Value, String> {
+    let paths = Paths::detect();
+    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+    let acc = load_account(&paths, &id)?;
+    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))?;
+    let plan = plans
+        .iter()
+        .find(|p| p.plan_id == plan_id)
+        .ok_or_else(|| "该套餐已不可领取，请刷新".to_string())?;
+    let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
+
+    *pending_guard() = Some(PendingClaim {
+        account_id: acc.id.clone(),
+        account_name: acc.name.clone(),
+        plan_id: plan.plan_id.clone(),
+        plan_name: display.clone(),
+        credentials: acc.credentials,
+        config: acc.config,
+        device_mid: mid,
+    });
+    open_captcha_window(&app)?;
+    Ok(json!({ "account": acc.name, "plan": display }))
+}
+
+#[tauri::command]
+async fn claim_captcha_config() -> Result<claim::CaptchaConfig, String> {
+    claim::fetch_captcha_config()
+}
+
+#[tauri::command]
+async fn claim_captcha_submit(
+    app: AppHandle,
+    param: String,
+    region: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let pending = pending_guard().take().ok_or("没有待领取的套餐")?;
+    let paths = Paths::detect();
+    let res = claim::submit_claim(
+        &paths.home,
+        &pending.credentials,
+        pending.config.as_ref(),
+        &pending.plan_id,
+        &param,
+        region.as_deref(),
+        Some(pending.device_mid),
+    );
+    close_captcha_window(&app);
+    let payload = match res {
+        Ok(v) => {
+            let ms = |k: &str| -> Option<i64> {
+                v.pointer(&format!("/data/plan/{k}"))
+                    .and_then(|x| x.as_i64())
+                    .map(|s| s * 1000)
+            };
+            let outcome = claim::ClaimOutcome {
+                account_id: pending.account_id.clone(),
+                account_name: pending.account_name.clone(),
+                plan_name: pending.plan_name.clone(),
+                starts_at: ms("starts_at"),
+                ends_at: ms("ends_at"),
+            };
+            let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+            let _ = app.emit("claim://result", &p);
+            p
+        }
+        Err(e) => {
+            let p = json!({
+                "ok": false,
+                "accountId": pending.account_id,
+                "accountName": pending.account_name,
+                "planName": pending.plan_name,
+                "message": e,
+            });
+            let _ = app.emit("claim://result", &p);
+            return Ok(p);
+        }
+    };
+    Ok(payload)
+}
+
+#[tauri::command]
+async fn claim_cancel(app: AppHandle) -> Result<(), String> {
+    *pending_guard() = None;
+    close_captcha_window(&app);
+    Ok(())
+}
+
+fn close_captcha_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("captcha") {
+        let _ = w.close();
+    }
+}
+
+struct PendingOAuth {
+    provider: String,
+    state: String,
+    flow: String,
+}
+
+static PENDING_OAUTH: Mutex<Option<PendingOAuth>> = Mutex::new(None);
+
+fn pending_oauth_guard() -> std::sync::MutexGuard<'static, Option<PendingOAuth>> {
+    match PENDING_OAUTH.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[tauri::command]
+async fn oauth_providers() -> Result<Vec<oauth::OAuthProvider>, String> {
+    Ok(oauth::OAUTH_PROVIDERS.to_vec())
+}
+
+#[tauri::command]
+async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Value, String> {
+    if !oauth::OAUTH_PROVIDERS.iter().any(|p| p.id == provider) {
+        return Err(format!("未知登录提供方：{provider}"));
+    }
+    let proxy_url: Option<tauri::Url> = match load_settings(&Paths::detect()).auth_proxy() {
+        Some(p) => {
+            let norm = oauth::parse_proxy_url(p)?;
+            Some(norm.parse().map_err(|e| format!("代理地址无效：{e}"))?)
+        }
+        None => None,
+    };
+    *pending_oauth_guard() = None;
+    if let Some(w) = app.get_webview_window("login") {
+        let _ = w.close();
+    }
+    let state = oauth::new_state();
+    let flow = uuid::Uuid::new_v4().to_string();
+    let url = oauth::authorize_url(&provider, &state)?;
+    *pending_oauth_guard() = Some(PendingOAuth { provider: provider.clone(), state: state.clone(), flow: flow.clone() });
+
+    let login_root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("无法定位应用数据目录：{e}"))?
+        .join("login-webview");
+    sweep_login_profiles(&login_root);
+    let profile_dir = login_root.join(&flow);
+
+    let app2 = app.clone();
+    let (provider2, state2, flow2) = (provider.clone(), state.clone(), flow.clone());
+    let mut builder = tauri::WebviewWindowBuilder::new(
+        &app,
+        "login",
+        tauri::WebviewUrl::External(url.parse().map_err(|e| format!("authorize URL 非法：{e}"))?),
+    )
+    .title("登录 ZCode 账号")
+    .theme(Some(tauri::Theme::Dark))
+    .inner_size(480.0, 680.0)
+    .min_inner_size(420.0, 560.0)
+    .resizable(true)
+    .user_agent(oauth::LOGIN_WINDOW_UA)
+    .data_directory(profile_dir);
+    if let Some(u) = proxy_url {
+        builder = builder.proxy_url(u);
+    }
+    builder
+    .on_navigation(move |url| {
+        if url.scheme() != "zcode" {
+            return true;
+        }
+        let full = url.to_string();
+        let (app3, p3, s3, f3) = (app2.clone(), provider2.clone(), state2.clone(), flow2.clone());
+        tauri::async_runtime::spawn(async move {
+            finish_oauth(&app3, p3, s3, f3, &full).await;
+        });
+        false
+    })
+    .build()
+    .map_err(|e| {
+        *pending_oauth_guard() = None;
+        format!("登录窗口创建失败：{e}")
+    })?;
+    Ok(json!({ "opened": true, "provider": provider }))
+}
+
+fn sweep_login_profiles(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if meta.is_dir() && meta.modified().map(|m| m < cutoff).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+#[tauri::command]
+async fn set_auth_proxy(app: AppHandle, on: bool, url: Option<String>) -> Result<(), String> {
+    {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        let trimmed = url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let normalized = match trimmed {
+            Some(s) => Some(oauth::parse_proxy_url(s)?),
+            None => None,
+        };
+        if on && normalized.is_none() {
+            return Err("开启代理前请先填写代理地址（http:// 或 socks5://）".into());
+        }
+        let mut s = load_settings(&paths);
+        s.auth_proxy_on = Some(on);
+        s.auth_proxy_url = normalized;
+        save_settings(&paths, &s)?;
+    }
+    let _ = app.emit("state-changed", ());
+    Ok(())
+}
+
+async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: String, callback_url: &str) {
+    let paths = Paths::detect();
+    let result = {
+        let provider = provider.clone();
+        let state = state.clone();
+        let flow = flow.clone();
+        let callback_url = callback_url.to_string();
+        tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
+            let flow_still_ours = || {
+                pending_oauth_guard()
+                    .as_ref()
+                    .map(|p| p.flow == flow)
+                    .unwrap_or(false)
+            };
+            {
+                let pending = pending_oauth_guard();
+                match pending.as_ref() {
+                    Some(p) if p.provider == provider && p.state == state && p.flow == flow => {}
+                    Some(_) | None => return Err("__superseded__".into()),
+                }
+            }
+            let (code, cb_state) = oauth::parse_callback(&callback_url)?;
+            if cb_state != state {
+                return Err("OAuth state 校验失败，请重新发起登录".into());
+            }
+            let mid = uuid::Uuid::new_v4().to_string();
+            let exchanged = oauth::exchange_token(&provider, &code, &state, &mid)?;
+            let jwt = exchanged["jwt"].as_str().unwrap_or_default().to_string();
+            let access_token = oauth::extract_access_token(&provider, &exchanged["raw"])
+                .unwrap_or_default();
+            let userinfo = oauth::extract_user_profile(&provider, &exchanged["raw"]).or_else(|| {
+                (!access_token.is_empty())
+                    .then(|| oauth::fetch_userinfo(&provider, &access_token))
+                    .flatten()
+            });
+            let credentials = oauth::assemble_credentials_with_token(
+                &provider,
+                &jwt,
+                userinfo.as_ref(),
+                (!access_token.is_empty()).then_some(access_token.as_str()),
+            );
+            let config = oauth::assemble_config(&provider, &jwt, &access_token);
+
+            let accounts = list_accounts(&paths)?;
+            let hash = canonical_hash(&credentials);
+            if let Some(dup) = accounts.iter().find(|a| a.hash == hash) {
+                *pending_oauth_guard() = None;
+                return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
+            }
+            let base = credentials
+                .get(format!("oauth:{provider}:user_info"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .and_then(|u| u.get("username").and_then(|x| x.as_str()).map(String::from))
+                .unwrap_or_else(|| match provider.as_str() {
+                    "zai" => "z.ai 账号".into(),
+                    _ => "BigModel 账号".into(),
+                });
+            let name = unique_name(&accounts, &base);
+            let ts = now_ts();
+            let acc = Account {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.clone(),
+                created_at: ts.clone(),
+                updated_at: ts,
+                hash,
+                credentials,
+                config: Some(config),
+                virtual_device_mid: Some(mid),
+            };
+            if !flow_still_ours() {
+                return Err("__superseded__".into());
+            }
+            save_account(&paths, &acc)?;
+            *pending_oauth_guard() = None;
+            Ok(json!({ "id": acc.id, "name": acc.name, "provider": provider }))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("登录流程异常：{e}")))
+    };
+
+    if let Err(e) = &result {
+        if e == "__superseded__" {
+            return;
+        }
+    }
+    if let Some(w) = app.get_webview_window("login") {
+        let _ = w.close();
+    }
+    let payload = match result {
+        Ok(v) => v,
+        Err(e) => json!({ "ok": false, "error": e }),
+    };
+    let _ = app.emit("oauth://done", &payload);
+}
+
+fn open_captcha_window(app: &AppHandle) -> Result<(), String> {
+    let (w, h) = (380.0, 320.0);
+    if let Some(win) = app.get_webview_window("captcha") {
+        let _ = win.eval("location.reload()");
+        center_over_main(app, &win, w, h);
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let win = tauri::WebviewWindowBuilder::new(
+        app,
+        "captcha",
+        tauri::WebviewUrl::App("captcha.html".into()),
+    )
+    .title("安全验证")
+    .theme(Some(tauri::Theme::Dark))
+    .background_color(tauri::window::Color(10, 10, 12, 255))
+    .inner_size(w, h)
+    .min_inner_size(340.0, 280.0)
+    .maximizable(false)
+    .resizable(false)
+    .additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server")
+    .visible(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+    center_over_main(app, &win, w, h);
+    let _ = win.show();
+    let _ = win.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+async fn kill_zcode(app: AppHandle) -> Result<(), String> {
+    let _guard = store_guard();
+    let r = if store::kill_zcode()? { Ok(()) } else { Err("关闭 ZCode 超时".into()) };
+    rebuild_tray(&app);
+    r
+}
+
+#[tauri::command]
+async fn set_behavior(
+    app: AppHandle,
+    launch_after_switch: Option<bool>,
+    close_to_tray: Option<bool>,
+    hot_switch: Option<bool>,
+) -> Result<(), String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    let mut s = load_settings(&paths);
+    if let Some(v) = launch_after_switch {
+        s.launch_after_switch = Some(v);
+    }
+    if let Some(v) = close_to_tray {
+        s.close_to_tray = Some(v);
+    }
+    if let Some(v) = hot_switch {
+        s.hot_switch = Some(v);
+    }
+    let r = save_settings(&paths, &s);
+    rebuild_tray(&app);
+    let _ = app.emit("state-changed", ());
+    r
+}
+
+#[tauri::command]
+async fn reveal_main(app: AppHandle) -> Result<(), String> {
+    let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    win.show().map_err(|e| e.to_string())?;
+    let _ = win.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_settings(app: AppHandle) -> Result<(), String> {
+    let (w, h) = (520.0, 700.0);
+    if let Some(win) = app.get_webview_window("settings") {
+        center_over_main(&app, &win, w, h);
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let win = tauri::WebviewWindowBuilder::new(
+        &app,
+        "settings",
+        tauri::WebviewUrl::App("settings.html".into()),
+    )
+    .title("Z·SWITCH 设置")
+    .theme(Some(tauri::Theme::Dark))
+    .background_color(tauri::window::Color(10, 10, 12, 255))
+    .inner_size(w, h)
+    .min_inner_size(440.0, 540.0)
+    .resizable(true)
+    .additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server")
+    .visible(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+    center_over_main(&app, &win, w, h);
+    let _ = win.show();
+    let _ = win.set_focus();
+    Ok(())
+}
+
+fn center_over_main(app: &AppHandle, win: &tauri::WebviewWindow, w: f64, h: f64) {
+    let Some(m) = app.get_webview_window("main") else { return };
+    let (Ok(p), Ok(s), Ok(scale)) = (m.outer_position(), m.outer_size(), m.scale_factor()) else { return };
+    let (mx, my) = (p.x as f64 / scale, p.y as f64 / scale);
+    let (mw, mh) = (s.width as f64 / scale, s.height as f64 / scale);
+    let x = mx + (mw - w).max(0.0) / 2.0;
+    let y = my + (mh - h).max(0.0) / 2.0;
+    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+}
+
+#[tauri::command]
+async fn autostart_status(app: AppHandle) -> Result<bool, String> {
+    let al = app.state::<AutoLaunchManager>();
+    al.is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn autostart_set(app: AppHandle, enable: bool) -> Result<bool, String> {
+    let al = app.state::<AutoLaunchManager>();
+    if enable {
+        al.enable().map_err(|e| e.to_string())?;
+    } else {
+        al.disable().map_err(|e| e.to_string())?;
+    }
+    al.is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn export_pick_path(app: AppHandle, id: String) -> Result<serde_json::Value, String> {
+    let acc = load_account(&Paths::detect(), &id)?;
+    let default_name = format!("{}.zsb", sanitize_filename(&acc.name));
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("ZSwitch 加密捆绑包（.zsb）", &["zsb"])
+        .set_file_name(&default_name)
+        .blocking_save_file();
+    let Some(fp) = picked else {
+        return Ok(json!({ "picked": false }));
+    };
+    let path = fp.into_path().map_err(|e| format!("路径无效：{e}"))?;
+    Ok(json!({ "picked": true, "path": path.to_string_lossy(), "name": acc.name }))
+}
+
+#[tauri::command]
+async fn export_finalize(path: String, id: String, password: String) -> Result<serde_json::Value, String> {
+    let acc = load_account(&Paths::detect(), &id)?;
+    let payload = store::export_bundle_value(std::slice::from_ref(&acc));
+    let sealed = cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?;
+    let body = serde_json::to_string_pretty(&sealed).unwrap() + "\n";
+    store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| format!("写入失败：{e}"))?;
+    Ok(json!({ "saved": true, "path": path }))
+}
+
+#[tauri::command]
+async fn export_all_pick_path(app: AppHandle) -> Result<serde_json::Value, String> {
+    let accounts = list_accounts(&Paths::detect())?;
+    if accounts.is_empty() {
+        return Err("账号库为空，没有可导出的内容".into());
+    }
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("ZSwitch 加密捆绑包（.zsb）", &["zsb"])
+        .set_file_name("zcode-accounts.zsb")
+        .blocking_save_file();
+    let Some(fp) = picked else {
+        return Ok(json!({ "picked": false }));
+    };
+    let path = fp.into_path().map_err(|e| format!("路径无效：{e}"))?;
+    Ok(json!({ "picked": true, "path": path.to_string_lossy(), "count": accounts.len() }))
+}
+
+#[tauri::command]
+async fn export_all_finalize(path: String, password: String) -> Result<serde_json::Value, String> {
+    let accounts = list_accounts(&Paths::detect())?;
+    if accounts.is_empty() {
+        return Err("账号库为空".into());
+    }
+    let payload = store::export_bundle_value(&accounts);
+    let sealed = cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?;
+    let body = serde_json::to_string_pretty(&sealed).unwrap() + "\n";
+    store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| format!("写入失败：{e}"))?;
+    Ok(json!({ "saved": true, "path": path, "count": accounts.len() }))
+}
+
+#[tauri::command]
+async fn import_pick_files(app: AppHandle) -> Result<serde_json::Value, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("ZSwitch 加密捆绑包（.zsb）", &["zsb"])
+        .blocking_pick_files();
+    let Some(files) = picked else {
+        return Ok(json!({ "picked": false }));
+    };
+    let mut sealed = vec![];
+    let mut errors = vec![];
+    for fp in files {
+        let path = match fp.into_path() {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(format!("路径错误：{e}"));
+                continue;
+            }
+        };
+        let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(format!("{fname}：读取失败 {e}"));
+                continue;
+            }
+        };
+        match serde_json::from_str::<Value>(&raw) {
+            Ok(v) => {
+                if !cipher::is_sealed(&v) {
+                    errors.push(format!("{fname}：不是加密捆绑包（仅支持本工具导出的 .zsb）"));
+                } else if v.get("format").and_then(|f| f.as_str()) != Some(cipher::FORMAT_BUNDLE) {
+                    errors.push(format!("{fname}：不是捆绑包格式（仅支持导出全部生成的 .zsb）"));
+                } else {
+                    sealed.push((fname, v));
+                }
+            }
+            Err(e) => errors.push(format!("{fname}：JSON 解析失败 {e}")),
+        }
+    }
+    Ok(json!({ "picked": true, "sealed": sealed, "errors": errors }))
+}
+
+#[tauri::command]
+async fn import_sealed(app: AppHandle, files: Vec<(String, Value)>, password: String) -> Result<ImportReport, String> {
+    let _guard = store_guard();
+    let mut decrypted = vec![];
+    let mut errors = vec![];
+    for (fname, v) in files {
+        match cipher::open(&v, &password) {
+            Ok(payload) => decrypted.push((fname, payload)),
+            Err(e) => errors.push(format!("{fname}：{e}")),
+        }
+    }
+    let mut report = if decrypted.is_empty() {
+        ImportReport::default()
+    } else {
+        import_values(&Paths::detect(), &decrypted)?
+    };
+    report.picked = true;
+    report.errors.extend(errors);
+    rebuild_tray(&app);
+    Ok(report)
+}
+
+#[tauri::command]
+async fn pick_zcode_path(app: AppHandle) -> Result<serde_json::Value, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("ZCode 可执行文件", &["exe"])
+        .blocking_pick_file();
+    let Some(fp) = picked else {
+        return Ok(json!({ "picked": false }));
+    };
+    let path = fp.into_path().map_err(|e| format!("路径无效：{e}"))?;
+    Ok(json!({ "picked": true, "path": path.to_string_lossy() }))
+}
+
+#[tauri::command]
+async fn set_zcode_path(app: AppHandle, path: String) -> Result<(), String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    let mut s = load_settings(&paths);
+    s.zcode_path = Some(path);
+    let r = save_settings(&paths, &s);
+    rebuild_tray(&app);
+    let _ = app.emit("state-changed", ());
+    r
+}
+
+#[tauri::command]
+async fn launch_zcode(app: AppHandle) -> Result<(), String> {
+    let paths = Paths::detect();
+    let (p, ok) = effective_zcode_path(&paths);
+    if !ok {
+        return Err(format!("ZCode 路径无效：{p}（在设置里修改）"));
+    }
+    let r = store::launch_zcode(&p);
+    rebuild_tray(&app);
+    r
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }))
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .invoke_handler(tauri::generate_handler![
+            get_state,
+            capture_current,
+            rename_account,
+            delete_account,
+            update_account_from_live,
+            switch_to,
+            get_live_quota,
+            get_account_quota,
+            claim_preview,
+            claim_start,
+            claim_captcha_config,
+            claim_captcha_submit,
+            claim_cancel,
+            oauth_providers,
+            oauth_begin,
+            set_auth_proxy,
+            kill_zcode,
+            set_behavior,
+            autostart_status,
+            autostart_set,
+            export_pick_path,
+            export_finalize,
+            export_all_pick_path,
+            export_all_finalize,
+            import_pick_files,
+            import_sealed,
+            pick_zcode_path,
+            set_zcode_path,
+            launch_zcode,
+            open_settings,
+            reveal_main,
+        ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let paths = Paths::detect();
+                    if store::load_settings(&paths).close_to_tray() {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+                if window.label() == "captcha" {
+                    *pending_guard() = None;
+                }
+                if window.label() == "login" {
+                    *pending_oauth_guard() = None;
+                }
+            }
+        })
+        .setup(|app| {
+            let _tray = TrayIconBuilder::with_id(TRAY_ID)
+                .icon(app.default_window_icon().expect("no window icon").clone())
+                .tooltip("Z·SWITCH")
+                .menu(&tray_menu_inner(app.handle())?)
+                .show_menu_on_left_click(false)
+                .on_menu_event(move |app, event| {
+                    let id = event.id().as_ref().to_string();
+                    match id.as_str() {
+                        "show" => show_main(app),
+                        "quit" => app.exit(0),
+                        other => run_tray_action(app.clone(), other.to_string()),
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
+                        show_main(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
