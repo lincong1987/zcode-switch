@@ -13,6 +13,7 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **Quota display**: inline plan quota and reset time per account row, multi-plan grouping, staggered polling
 - **Claim promotions**: one-click claim for eligible promotions (GUI captcha)
 - **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption
+- **Bilingual UI (中文 / English)**: one-click switch in Settings — main window, tray, error messages and CLI output all covered; first run follows your OS language
 - **Tray / autostart / CLI automation**
 
 ## Security Design
@@ -38,6 +39,7 @@ zcode-switch.exe --cli export --id <id> --out <a.zsb>
 zcode-switch.exe --cli export-all --out <all.zsb>
 zcode-switch.exe --cli import --file <file.zsb>
 zcode-switch.exe --cli rename|delete|update|behavior|setpath|launch
+zcode-switch.exe --cli --lang en state              # English output (--lang takes a space-separated value, works anywhere in the command line; defaults to the GUI/system language)
 ```
 
 CLI password (export / import): prefer the `ZSW_PASSWORD` environment variable (keeps it out of process lists and command history); `--password <password>` also works.
