@@ -210,6 +210,14 @@ pub struct QuotaItem {
     pub server_percentage: Option<f64>,
     pub unit: String,
     pub period_end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -218,6 +226,8 @@ pub struct PlanSlot {
     pub pid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -336,7 +346,7 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
         let resp = req.call();
         match resp {
             Ok(r) => {
-                let text = r.into_string().map_err(|e| format!("读取响应失败：{e}"))?;
+                let text = r.into_string().map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
                 return Ok(if text.is_empty() {
                     Value::Null
                 } else {
@@ -347,28 +357,28 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
                 let body = r.into_string().unwrap_or_default();
                 if let Ok(v) = serde_json::from_str::<Value>(&body) {
                     if v.get("code").and_then(|c| c.as_i64()) == Some(401) {
-                        return Err("Token 已过期或无效（业务码 401）".into());
+                        return Err(crate::i18n::tr("err.token.biz401"));
                     }
                 }
                 if code == 429 {
                     match backoff.next() {
                         Some(d) => {
-                            last_err = Some("服务端限流，正在重试...".into());
+                            last_err = Some(crate::i18n::tr("err.quota.rate_limited"));
                             sleep(Duration::from_millis(*d));
                             continue;
                         }
-                        None => return Err(last_err.unwrap_or_else(|| "额度接口 HTTP 429".into())),
+                        None => return Err(last_err.unwrap_or_else(|| crate::i18n::tr("err.quota.http429"))),
                     }
                 }
                 if code == 401 || code == 403 {
-                    return Err(format!("Token 已过期或无效（HTTP {code}）"));
+                    return Err(crate::i18n::trf("err.token.http401", &[("code", &code.to_string())]));
                 }
                 let msg = serde_json::from_str::<Value>(&body)
                     .ok()
                     .and_then(|v| ["message", "msg", "error"].iter().find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)));
-                return Err(format!("额度接口 HTTP {code}: {}", msg.unwrap_or_default()));
+                return Err(crate::i18n::trf("err.quota.http", &[("code", &code.to_string()), ("msg", &msg.unwrap_or_default())]));
             }
-            Err(e) => return Err(format!("网络请求失败：{e}")),
+            Err(e) => return Err(crate::i18n::trf("err.network", &[("e", &e.to_string())])),
         }
     }
 }
@@ -389,15 +399,15 @@ fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, S
             }
             let code = limit_resp.get("code").and_then(|c| c.as_i64());
             best_err = Some(match code {
-                Some(401) => "Token 已过期或无效（业务码 401）".into(),
+                Some(401) => crate::i18n::tr("err.token.biz401"),
                 Some(c) => {
                     let msg = ["msg", "message", "error"]
                         .iter()
                         .find_map(|k| limit_resp.get(k).and_then(|x| x.as_str()).map(String::from))
                         .unwrap_or_default();
-                    format!("业务码 {c}: {msg}")
+                    crate::i18n::trf("err.quota.biz", &[("code", &c.to_string()), ("msg", &msg)])
                 }
-                None => "额度接口返回异常".into(),
+                None => crate::i18n::tr("err.quota.bad_resp"),
             });
         }
         Err(e) => best_err = Some(e),
@@ -419,7 +429,7 @@ fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, S
         }
     }
 
-    Err(best_err.unwrap_or_else(|| "额度查询失败".into()))
+    Err(best_err.unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }
 
 fn query_with_token(token: &str) -> Result<QuotaOverview, String> {
@@ -434,7 +444,7 @@ fn business_ok(v: &Value) -> bool {
 
 pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
     if tokens.is_empty() {
-        return Err("未找到可用于查询额度的 ZCode token，请先登录或切换账号".into());
+        return Err(crate::i18n::tr("err.quota.no_token"));
     }
     let mut last_err: Option<String> = None;
     let mut first_business: Option<String> = None;
@@ -457,9 +467,9 @@ pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
         if let Ok(ov) = query_with_token(&tokens[0]) {
             return Ok(ov);
         }
-        return Err("该账号 Token 已过期，请删除后重新登录".into());
+        return Err(crate::i18n::tr("err.token.expired"));
     }
-    Err(first_business.or(last_err).unwrap_or_else(|| "额度查询失败".into()))
+    Err(first_business.or(last_err).unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -578,7 +588,7 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
                             saw_no_plan = true;
                         } else if best_err.is_none() {
                             let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-                            best_err = Some(format!("业务码 {code}: {msg}"));
+                            best_err = Some(crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]));
                         }
                     }
                 }
@@ -609,7 +619,7 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
                                 .find_map(|k| resp.get(k).and_then(|x| x.as_str()).map(String::from))
                                 .unwrap_or_default();
                             let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-                            best_err = Some(format!("业务码 {code}: {msg}"));
+                            best_err = Some(crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]));
                         }
                     }
                     Err(e) => {
@@ -625,7 +635,7 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
         if saw_no_plan {
             return Ok(no_plan_overview());
         }
-        return Err(best_err.unwrap_or_else(|| "额度查询失败".into()));
+        return Err(best_err.unwrap_or_else(|| crate::i18n::tr("err.quota.fail")));
     }
     Ok(merge_parts(parts))
 }
@@ -663,7 +673,7 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
         }
         pri_idx = match pri_idx {
             None => Some(i),
-            Some(p) if tier_rank(s.tier.as_deref()) > tier_rank(slots[p].tier.as_deref()) => Some(i),
+            Some(p) if tier_rank(s.tier_code.as_deref()) > tier_rank(slots[p].tier_code.as_deref()) => Some(i),
             _ => pri_idx,
         };
     }
@@ -706,13 +716,16 @@ pub fn quota_for_snapshot(home: &Path, creds: &Value, config: Option<&Value>) ->
     quota_for_live(home, creds, config)
 }
 
-fn unit_label(unit: Option<i64>, number: Option<i64>) -> String {
+fn unit_label(unit: Option<i64>, number: Option<i64>) -> (String, String) {
     match unit {
-        Some(3) => format!("每 {} 小时", number.unwrap_or(5)),
-        Some(4) => "每天".into(),
-        Some(5) => "每月".into(),
-        Some(6) => "每周".into(),
-        _ => "每周期".into(),
+        Some(3) => {
+            let n = number.unwrap_or(5);
+            (format!("每 {n} 小时"), format!("hours:{n}"))
+        }
+        Some(4) => ("每天".into(), "daily".into()),
+        Some(5) => ("每月".into(), "monthly".into()),
+        Some(6) => ("每周".into(), "weekly".into()),
+        _ => ("每周期".into(), "cycle".into()),
     }
 }
 
@@ -722,7 +735,7 @@ fn fmt_reset_time(ms: Option<i64>) -> Option<String> {
         return None;
     }
     use chrono::TimeZone;
-    Some(chrono::Local.timestamp_millis_opt(ms).single()?.format("%m-%d %H:%M 重置").to_string())
+    Some(chrono::Local.timestamp_millis_opt(ms).single()?.format("%m-%d %H:%M").to_string())
 }
 
 fn safe_prefix(s: &str, n: usize) -> &str {
@@ -826,17 +839,18 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
         let remaining = l.get("remaining").and_then(|v| v.as_f64());
         let percentage = l.get("percentage").and_then(|v| v.as_f64());
         let reset_ms = l.get("nextResetTime").and_then(|v| v.as_i64());
-        let period = unit_label(unit, number);
-        let (name, unit_str) = match typ {
-            "TOKENS_LIMIT" => (format!("提示次数（{period}）"), "次".into()),
-            "TIME_LIMIT" => (format!("使用时长（{period}）"), "分钟".into()),
-            _ => (format!("{typ}（{period}）"), "".into()),
+        let (period, window) = unit_label(unit, number);
+        let (kind, name, unit_str, unit_code) = match typ {
+            "TOKENS_LIMIT" => ("prompt_count", format!("提示次数（{period}）"), "次".to_string(), "count"),
+            "TIME_LIMIT" => ("duration", format!("使用时长（{period}）"), "分钟".to_string(), "minutes"),
+            _ => ("raw", format!("{typ}（{period}）"), String::new(), ""),
         };
         let percent_used = if let (Some(t), Some(u)) = (total, used) {
             if t > 0.0 { Some((u / t * 100.0).clamp(0.0, 100.0)) } else { None }
         } else {
             percentage.map(|p| p.clamp(0.0, 100.0))
         };
+        let reset = fmt_reset_time(reset_ms);
         let item = QuotaItem {
             name,
             total,
@@ -845,7 +859,11 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             percent_used,
             server_percentage: percentage,
             unit: unit_str,
-            period_end: fmt_reset_time(reset_ms),
+            period_end: reset.as_ref().map(|r| format!("{r} 重置")),
+            kind: (kind != "").then(|| kind.to_string()),
+            window: Some(window),
+            unit_code: (unit_code != "").then(|| unit_code.to_string()),
+            reset,
         };
         if typ == "TIME_LIMIT" && total.is_some() {
             main = main.or(Some(item.clone()));
@@ -897,6 +915,7 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
         vec![PlanSlot {
             pid: String::new(),
             tier: plan_tier.clone(),
+            tier_code: plan_tier.as_deref().map(tier_code_from_display),
             name: product_name,
             expire: plan_expire.clone(),
             total,
@@ -1029,44 +1048,55 @@ pub fn extract_plan_tier(current_data: &Value) -> Option<String> {
     }
 }
 
-fn plan_tier_from_id(plan_id: &str, name: Option<&str>) -> String {
+fn plan_tier_from_id(plan_id: &str, name: Option<&str>) -> (String, String) {
     let mut hay = plan_id.to_lowercase();
     if let Some(n) = name {
         hay.push(' ');
         hay.push_str(&n.to_lowercase());
     }
     if hay.contains("max") {
-        "Max".into()
+        ("Max".into(), "max".into())
     } else if hay.contains("pro") {
-        "Pro".into()
+        ("Pro".into(), "pro".into())
     } else if hay.contains("lite") {
-        "Lite".into()
+        ("Lite".into(), "lite".into())
     } else if hay.contains("start") {
-        "Start Plan".into()
+        ("Start Plan".into(), "start".into())
     } else if ["trial", "taste", "experience", "gift", "weekend", "promo", "activity", "体验"]
         .iter()
         .any(|k| hay.contains(k))
     {
-        "体验".into()
+        ("体验".into(), "trial".into())
     } else {
-        plan_id.to_string()
+        (plan_id.to_string(), "other".into())
     }
 }
 
-fn tier_rank(tier: Option<&str>) -> u8 {
-    let t = tier.unwrap_or("");
-    if t.eq_ignore_ascii_case("max") {
-        5
-    } else if t.eq_ignore_ascii_case("pro") {
-        4
-    } else if t.eq_ignore_ascii_case("lite") {
-        3
-    } else if t.eq_ignore_ascii_case("Start Plan") {
-        2
-    } else if t == "体验" {
-        1
+fn tier_code_from_display(tier: &str) -> String {
+    let t = tier.to_lowercase();
+    if t.contains("max") {
+        "max".into()
+    } else if t.contains("pro") {
+        "pro".into()
+    } else if t.contains("lite") {
+        "lite".into()
+    } else if t.contains("start") {
+        "start".into()
+    } else if t.contains("trial") || tier.contains("体验") {
+        "trial".into()
     } else {
-        0
+        "other".into()
+    }
+}
+
+fn tier_rank(code: Option<&str>) -> u8 {
+    match code.unwrap_or("") {
+        "max" => 5,
+        "pro" => 4,
+        "lite" => 3,
+        "start" => 2,
+        "trial" => 1,
+        _ => 0,
     }
 }
 
@@ -1092,9 +1122,11 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 .map(|pl| {
                     let pid = pl.get("plan_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let pname = pl.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                    let (tier, tier_code) = plan_tier_from_id(&pid, pname.as_deref());
                     PlanSlot {
                         pid: pid.clone(),
-                        tier: Some(plan_tier_from_id(&pid, pname.as_deref())),
+                        tier: Some(tier),
+                        tier_code: Some(tier_code),
                         name: Some(pname.filter(|s| !s.trim().is_empty()).unwrap_or(pid)),
                         expire: extract_expire(pl),
                         ..Default::default()
@@ -1128,7 +1160,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 name: ["show_name", "name", "entitlement_id", "plan_id"]
                     .iter()
                     .find_map(|k| item.get(k).and_then(Value::as_str))
-                    .unwrap_or("未知模型")
+                    .unwrap_or("Unknown")
                     .to_string(),
                 total: it_total,
                 used: it_used,
@@ -1140,6 +1172,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 server_percentage: None,
                 unit: item.get("unit_type").or_else(|| item.get("meter")).and_then(Value::as_str).unwrap_or("quota").to_string(),
                 period_end: ["period_end", "expires_at"].iter().find_map(|k| item.get(k).and_then(Value::as_str)).map(String::from),
+                ..Default::default()
             };
             let bpid = ["plan_id", "planId", "entitlement_id"]
                 .iter()
@@ -1161,8 +1194,10 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
 
     if slots.is_empty() {
         if !loose.is_empty() {
+            let t = extract_plan_tier(balance_data);
             slots.push(PlanSlot {
-                tier: extract_plan_tier(balance_data),
+                tier_code: t.as_deref().map(tier_code_from_display),
+                tier: t,
                 items: std::mem::take(&mut loose),
                 ..Default::default()
             });
@@ -1177,8 +1212,10 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 first_number(&pool, &["remaining", "remain", "balance", "available", "availableQuota", "left", "quotaRemaining"])
             });
             if ptot.is_some() || pused.is_some() || prem.is_some() {
+                let t = extract_plan_tier(balance_data);
                 slots.push(PlanSlot {
-                    tier: extract_plan_tier(balance_data),
+                    tier_code: t.as_deref().map(tier_code_from_display),
+                    tier: t,
                     total: ptot,
                     used: pused,
                     remaining: prem,
@@ -1189,6 +1226,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
     } else if !loose.is_empty() {
         slots.push(PlanSlot {
             name: Some("其他额度".into()),
+            tier_code: Some("other".into()),
             items: loose,
             ..Default::default()
         });
@@ -1229,7 +1267,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
     }
     let mut pri_idx = 0usize;
     for (i, s) in slots.iter().enumerate() {
-        if tier_rank(s.tier.as_deref()) > tier_rank(slots[pri_idx].tier.as_deref()) {
+        if tier_rank(s.tier_code.as_deref()) > tier_rank(slots[pri_idx].tier_code.as_deref()) {
             pri_idx = i;
         }
     }

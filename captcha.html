@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>安全验证</title>
+    <title>Z·SWITCH</title>
     <style>
       html, body { background: #0a0a0c; }
     </style>
@@ -13,13 +13,14 @@
     <div id="cap-app">
       <div class="cap-status">
         <div id="cap-dot" class="cap-dot"></div>
-        <div id="cap-text">正在准备安全验证…</div>
+        <!-- 文案由 captcha.js 按语言注入（避免 en 模式首帧闪中文） -->
+        <div id="cap-text"></div>
       </div>
       <div id="cap-detail" class="cap-detail"></div>
       <!-- Aliyun SDK popup 容器 + 触发按钮（无感通过时不可见；风控时显示给用户点） -->
       <div id="cap-holder"></div>
-      <button id="cap-btn" type="button" hidden>点击完成验证</button>
-      <div class="cap-foot">验证由阿里云提供 · 与 ZCode 客户端同款流程</div>
+      <button id="cap-btn" type="button" hidden></button>
+      <div class="cap-foot"></div>
     </div>
     <script type="module" src="/src/captcha.js"></script>
   </body>

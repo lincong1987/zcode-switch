@@ -1,4 +1,5 @@
 
+use crate::i18n::{tr, trf};
 use crate::quota;
 use crate::zcrypto;
 use chrono::Local;
@@ -72,7 +73,7 @@ impl Paths {
     pub fn live_telemetry(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("telemetry-state.json") }
 
     pub fn ensure_dirs(&self) -> Result<(), String> {
-        fs::create_dir_all(self.accounts_dir()).map_err(|e| format!("无法创建账号库目录：{e}"))?;
+        fs::create_dir_all(self.accounts_dir()).map_err(|e| trf("err.store.mk_accounts_dir", &[("e", &e.to_string())]))?;
         Ok(())
     }
 }
@@ -102,6 +103,8 @@ pub struct Settings {
     pub auth_proxy_on: Option<bool>,
     #[serde(default)]
     pub auth_proxy_url: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 impl Settings {
@@ -145,6 +148,7 @@ pub struct AppState {
     pub hot_switch: bool,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
+    pub language: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -191,10 +195,10 @@ pub fn is_logged_in(v: &Value) -> bool {
 
 pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
-    fs::write(&tmp, data).map_err(|e| format!("写入失败 {}: {e}", path.display()))?;
+    fs::write(&tmp, data).map_err(|e| trf("err.write_file", &[("path", &path.display().to_string()), ("e", &e.to_string())]))?;
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("落盘失败 {}: {e}", path.display()));
+        return Err(trf("err.rename_fail", &[("path", &path.display().to_string()), ("e", &e.to_string())]));
     }
     Ok(())
 }
@@ -204,11 +208,11 @@ pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
         return Ok(None);
     }
     let raw = fs::read_to_string(paths.live_file())
-        .map_err(|e| format!("无法读取 {}: {e}", paths.live_file().display()))?;
+        .map_err(|e| trf("err.read", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("{} 不是有效的 JSON：{e}", paths.live_file().display()))?;
+        .map_err(|e| trf("err.bad_json", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
     if !v.is_object() {
-        return Err("credentials.json 内容不是对象".into());
+        return Err(tr("err.store.not_object"));
     }
     Ok(Some(v))
 }
@@ -220,7 +224,7 @@ pub fn read_live_config(paths: &Paths) -> Option<Value> {
 
 pub fn write_live(paths: &Paths, v: &Value) -> Result<(), String> {
     if let Some(parent) = paths.live_file().parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("无法创建目录：{e}"))?;
+        fs::create_dir_all(parent).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
     }
     let body = serde_json::to_string_pretty(v).unwrap_or_default() + "\n";
     atomic_write(&paths.live_file(), &body)
@@ -325,11 +329,11 @@ pub fn launch_zcode(path: &str) -> Result<(), String> {
     }
     let p = PathBuf::from(path);
     if !p.exists() {
-        return Err(format!("ZCode 不存在：{path}（在设置里修改路径）"));
+        return Err(trf("err.zcode.missing", &[("path", path)]));
     }
     detached(Command::new(&p))
         .spawn()
-        .map_err(|e| format!("启动失败：{e}"))?;
+        .map_err(|e| trf("err.zcode.launch", &[("e", &e.to_string())]))?;
     Ok(())
 }
 
@@ -392,8 +396,8 @@ pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
         return Ok(vec![]);
     }
     let mut out = vec![];
-    for entry in fs::read_dir(&dir).map_err(|e| format!("读取账号库失败：{e}"))? {
-        let entry = entry.map_err(|e| format!("读取账号库失败：{e}"))?;
+    for entry in fs::read_dir(&dir).map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))? {
+        let entry = entry.map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -417,11 +421,11 @@ pub fn save_account(paths: &Paths, acc: &Account) -> Result<(), String> {
 
 pub fn load_account(paths: &Paths, id: &str) -> Result<Account, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err("非法的账号 id".into());
+        return Err(tr("err.store.bad_id"));
     }
     let path = paths.accounts_dir().join(format!("{id}.json"));
-    let raw = fs::read_to_string(&path).map_err(|_| format!("账号不存在：{id}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("账号存档损坏：{e}"))
+    let raw = fs::read_to_string(&path).map_err(|_| trf("err.store.no_account_id", &[("id", id)]))?;
+    serde_json::from_str(&raw).map_err(|e| trf("err.store.corrupt", &[("e", &e.to_string())]))
 }
 
 fn name_exists(accounts: &[Account], name: &str) -> bool {
@@ -442,21 +446,21 @@ pub fn unique_name(accounts: &[Account], base: &str) -> String {
 }
 
 pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, String> {
-    let live = read_live(paths)?.ok_or("当前没有 credentials.json，请先在 ZCode 里登录")?;
+    let live = read_live(paths)?.ok_or(tr("err.live.no_creds_file"))?;
     if !is_logged_in(&live) {
-        return Err("当前文件里没有登录凭据（未登录）".into());
+        return Err(tr("err.live.no_credentials"));
     }
     let hash = canonical_hash(&live);
     let accounts = list_accounts(paths)?;
     if let Some(dup) = accounts.iter().find(|a| a.hash == hash) {
-        return Err(format!("当前登录已保存为「{}」，无需重复保存", dup.name));
+        return Err(trf("err.live.dup_saved", &[("name", &dup.name)]));
     }
     let config = read_live_config(paths);
     let name = match name {
         Some(n) => unique_name(&accounts, &n),
         None => {
             let id = zcrypto::account_identity(&live, &paths.home);
-            unique_name(&accounts, &id.label().unwrap_or_else(|| "账号 1".into()))
+            unique_name(&accounts, &id.label().unwrap_or_else(|| "Account 1".into()))
         }
     };
     let ts = now_ts();
@@ -486,7 +490,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
     if accounts.iter().any(|a| a.hash == hash) {
         return Ok(None);
     }
-    let name = unique_name(accounts, &format!("自动保存 {}", Local::now().format("%m-%d %H%M")));
+    let name = unique_name(accounts, &format!("Auto {}", Local::now().format("%m-%d %H%M")));
     let ts = now_ts();
     let mut acc = Account {
         id: Uuid::new_v4().to_string(),
@@ -544,10 +548,10 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     let mut killed = false;
     if running {
         if !force {
-            return Err("ZCode 正在运行，请先完全退出（含托盘），或使用强制切换（自动关闭并重启）".into());
+            return Err(tr("err.switch.running"));
         }
         if !kill_zcode()? {
-            return Err("关闭 ZCode 超时，已取消切换（避免登录态损坏）".into());
+            return Err(tr("err.switch.kill_timeout"));
         }
         killed = true;
     }
@@ -595,13 +599,13 @@ fn hot_swap_verified(paths: &Paths, target: &Account) -> Result<(), String> {
     let backoff = |attempt: u32| std::thread::sleep(std::time::Duration::from_millis(250 + u64::from(attempt) * 250));
     for attempt in 0..3u32 {
         if let Err(e) = write_live(paths, &target.credentials) {
-            last_err = Some(format!("写入失败：{e}"));
+            last_err = Some(trf("err.write", &[("e", &e)]));
             backoff(attempt);
             continue;
         }
         if let Some(cfg) = &target.config {
             if let Err(e) = write_live_config(paths, cfg) {
-                last_err = Some(format!("写入 config 失败：{e}"));
+                last_err = Some(trf("err.write_config", &[("e", &e)]));
                 backoff(attempt);
                 continue;
             }
@@ -618,7 +622,7 @@ fn hot_swap_verified(paths: &Paths, target: &Account) -> Result<(), String> {
         }
         backoff(attempt);
     }
-    Err(last_err.unwrap_or_else(|| "热切换校验失败：ZCode 并发回写冲突，已重试 3 次。建议改用重启式切换".into()))
+    Err(last_err.unwrap_or_else(|| tr("err.hot.verify")))
 }
 
 fn identity_has_signal(id: &zcrypto::Identity) -> bool {
@@ -644,10 +648,10 @@ fn identity_matches(a: &zcrypto::Identity, b: &zcrypto::Identity) -> bool {
 pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account, String> {
     let name = new_name.trim();
     if name.is_empty() {
-        return Err("名称不能为空".into());
+        return Err(tr("err.name.empty"));
     }
     if name.chars().count() > 40 {
-        return Err("名称过长（最多 40 字符）".into());
+        return Err(tr("err.name.too_long"));
     }
     let mut acc = load_account(paths, id)?;
     let accounts = list_accounts(paths)?;
@@ -655,7 +659,7 @@ pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account
         .iter()
         .find(|a| a.id != id && a.name.eq_ignore_ascii_case(name))
     {
-        return Err(format!("名称「{}」已被账号「{}」占用", name, other.name));
+        return Err(trf("err.name.taken", &[("name", name), ("other", &other.name)]));
     }
     acc.name = name.to_string();
     acc.updated_at = now_ts();
@@ -665,24 +669,24 @@ pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account
 
 pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err("非法的账号 id".into());
+        return Err(tr("err.store.bad_id"));
     }
     let path = paths.accounts_dir().join(format!("{id}.json"));
     if !path.exists() {
-        return Err("账号不存在".into());
+        return Err(tr("err.store.no_account"));
     }
-    fs::remove_file(&path).map_err(|e| format!("删除失败：{e}"))
+    fs::remove_file(&path).map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))
 }
 
 pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, String> {
-    let live = read_live(paths)?.ok_or("当前没有登录文件")?;
+    let live = read_live(paths)?.ok_or(tr("err.live.no_file"))?;
     if !is_logged_in(&live) {
-        return Err("当前未登录".into());
+        return Err(tr("err.live.logged_out"));
     }
     let hash = canonical_hash(&live);
     let accounts = list_accounts(paths)?;
     if let Some(other) = accounts.iter().find(|a| a.id != id && a.hash == hash) {
-        return Err(format!("当前登录与「{}」一致，请直接切换", other.name));
+        return Err(trf("err.live.same", &[("name", &other.name)]));
     }
     let mut acc = load_account(paths, id)?;
     acc.hash = hash;
@@ -694,9 +698,9 @@ pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, Stri
 }
 
 pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
-    let creds = read_live(paths)?.ok_or("当前没有登录文件")?;
+    let creds = read_live(paths)?.ok_or(tr("err.live.no_file"))?;
     if !is_logged_in(&creds) {
-        return Err("当前未登录，无法查询额度".into());
+        return Err(tr("err.live.quota"));
     }
     quota::quota_for_live(&paths.home, &creds, read_live_config(paths).as_ref())
 }
@@ -791,10 +795,10 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
         let arr = v
             .get("accounts")
             .and_then(|a| a.as_array())
-            .ok_or("捆绑包缺少 accounts 数组")?;
+            .ok_or(tr("err.bundle.no_accounts"))?;
         let mut out = vec![];
         for item in arr {
-            let creds = item.get("credentials").cloned().ok_or("捆绑包条目缺少 credentials")?;
+            let creds = item.get("credentials").cloned().ok_or(tr("err.bundle.no_creds"))?;
             out.push((
                 item.get("name").and_then(|n| n.as_str()).map(String::from),
                 creds,
@@ -803,7 +807,7 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
         }
         return Ok(out);
     }
-    Err("无法识别的文件格式（仅支持本工具导出的加密捆绑包 .zsb）".into())
+    Err(tr("err.bundle.unrecognized"))
 }
 
 pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportReport, String> {
@@ -816,23 +820,23 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
         let cands = match import_candidates(v) {
             Ok(c) => c,
             Err(e) => {
-                report.errors.push(format!("{fname}：{e}"));
+                report.errors.push(trf("err.import.wrap", &[("fname", fname.as_str()), ("e", e.as_str())]));
                 continue;
             }
         };
         for (name_opt, creds, config_opt) in cands {
             if !is_logged_in(&creds) {
-                report.skipped.push(format!("{fname}：无登录凭据"));
+                report.skipped.push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
                 continue;
             }
             let hash = canonical_hash(&creds);
             if accounts.iter().any(|a| a.hash == hash) || new_accounts.iter().any(|a| a.hash == hash) {
-                report.skipped.push(format!("{fname}：已存在于账号库"));
+                report.skipped.push(trf("err.import.dup", &[("fname", fname.as_str())]));
                 continue;
             }
             let base_name = name_opt.unwrap_or_else(|| {
                 let id = zcrypto::account_identity(&creds, &paths.home);
-                id.label().unwrap_or_else(|| format!("导入 {}", Local::now().format("%m-%d %H%M")))
+                id.label().unwrap_or_else(|| format!("Import {}", Local::now().format("%m-%d %H%M")))
             });
             let name = unique_name(&accounts, &base_name);
             let ts = now_ts();
@@ -899,6 +903,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         hot_switch: settings.hot_switch(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
+        language: crate::i18n::current().as_str().to_string(),
     })
 }
 

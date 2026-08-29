@@ -656,6 +656,32 @@ input:focus-visible,
 .toggle.on { background: rgba(232, 163, 61, .25); border-color: var(--amber-deep); }
 .toggle.on .knob { transform: translateX(18px); background: var(--amber); }
 
+.lang-seg {
+  display: flex;
+  gap: 4px;
+  padding: 2px;
+  border: 1px solid var(--hairline);
+  border-radius: 11px;
+  background: #2b2e36;
+  flex: none;
+}
+.lang-opt {
+  border: none;
+  background: transparent;
+  color: var(--ink-mute);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 3px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.lang-opt:hover { color: var(--ink); }
+.lang-opt.on {
+  background: rgba(232, 163, 61, .25);
+  color: var(--amber);
+}
+
 .tier-b {
   font-family: var(--mono);
   font-size: 11.5px;

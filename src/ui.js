@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ic } from "./icons.js";
+import { t, has, errCode, stripErr } from "./i18n.js";
 
 document.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -90,8 +91,8 @@ export function openConfirmModal(m) {
       </div>
       ${m.desc ? `<div class="cm-desc">${m.desc}</div>` : ""}
       <div class="cm-actions">
-        <button class="btn-ghost cm-no">${esc(m.noLabel || "取消")}</button>
-        <button class="cm-yes ${kind}">${esc(m.yesLabel || "确认")}</button>
+        <button class="btn-ghost cm-no">${esc(m.noLabel || t("common.cancel"))}</button>
+        <button class="cm-yes ${kind}">${esc(m.yesLabel || t("common.confirm"))}</button>
       </div>
     </div>`;
   document.body.appendChild(mask);
@@ -121,12 +122,12 @@ export function openConfirmModal(m) {
 export function openPwModal(m) {
   document.querySelector(".pw-mask")?.remove();
   const isExport = m.mode === "export" || m.mode === "exportAll";
-  const title = m.mode === "export" ? `导出「${esc(m.name)}」`
-    : m.mode === "exportAll" ? `导出全部（${m.count} 个账号）`
-    : `导入 ${m.files.length} 个加密文件`;
+  const title = m.mode === "export" ? t("pw.exportTitle", { name: esc(m.name) })
+    : m.mode === "exportAll" ? t("pw.exportAllTitle", { count: m.count })
+    : t("pw.importTitle", { count: m.files.length });
   const sub = isExport
-    ? `保存到 ${esc(m.path)}<br>文件含登录凭据（credentials + config 捆包），<b>由你自设密码加密</b>，密码丢失无法找回`
-    : `${m.files.map(([n]) => esc(n)).join("、")}<br>输入导出时设置的密码`;
+    ? t("pw.exportSub", { path: esc(m.path) })
+    : t("pw.importSub", { files: m.files.map(([n]) => esc(n)).join(t("common.listSep")) });
 
   const mask = document.createElement("div");
   mask.className = "pw-mask";
@@ -134,12 +135,12 @@ export function openPwModal(m) {
     <div class="pw-panel">
       <div class="pw-title">${title}</div>
       <div class="pw-sub">${sub}</div>
-      <input class="pw-input" type="password" id="pw1" placeholder="${isExport ? "设置密码（至少 6 位）" : "密码"}" autocomplete="off">
-      ${isExport ? `<input class="pw-input" type="password" id="pw2" placeholder="再输入一次确认" autocomplete="off">` : ""}
+      <input class="pw-input" type="password" id="pw1" placeholder="${isExport ? t("pw.setPw") : t("pw.pw")}" autocomplete="off">
+      ${isExport ? `<input class="pw-input" type="password" id="pw2" placeholder="${t("pw.pwAgain")}" autocomplete="off">` : ""}
       <div class="pw-err"></div>
       <div class="pw-actions">
-        <button class="btn-ghost pw-cancel">取消</button>
-        <button class="btn-primary pw-go has-ic">${isExport ? ic("lock", 14) + " 加密导出" : ic("lockOpen", 14) + " 解密导入"}</button>
+        <button class="btn-ghost pw-cancel">${t("common.cancel")}</button>
+        <button class="btn-primary pw-go has-ic">${isExport ? ic("lock", 14) + " " + t("pw.encryptExport") : ic("lockOpen", 14) + " " + t("pw.decryptImport")}</button>
       </div>
     </div>`;
   document.body.appendChild(mask);
@@ -162,30 +163,30 @@ export function openPwModal(m) {
   async function confirm() {
     const pw1 = input1?.value || "";
     const pw2 = input2?.value;
-    if (pw1.length < 6) return (errEl.textContent = "密码至少 6 位");
-    if (pw2 !== undefined && pw2 !== null && pw1 !== pw2) return (errEl.textContent = "两次输入不一致");
+    if (pw1.length < 6) return (errEl.textContent = t("pw.errMinLen"));
+    if (pw2 !== undefined && pw2 !== null && pw1 !== pw2) return (errEl.textContent = t("pw.errMismatch"));
     go.disabled = true;
     try {
       if (m.mode === "export") {
         const r = await invoke("export_finalize", { path: m.path, id: m.id, password: pw1 });
-        toast(`已加密导出到 ${r.path}`, "ok", "凭据捆包 + 口令加密（记得密码）；.zsb 可在任意一台机器导入");
+        toast(t("pw.exportedToast", { path: r.path }), "ok", t("pw.exportedToastDetail"));
         m.onDone?.(r);
       } else if (m.mode === "exportAll") {
         const r = await invoke("export_all_finalize", { path: m.path, password: pw1 });
-        toast(`已加密导出 ${r.count} 个账号`, "ok", r.path);
+        toast(t("pw.exportedAllToast", { count: r.count }), "ok", r.path);
         m.onDone?.(r);
       } else {
         let report = await invoke("import_sealed", { files: m.files, password: pw1 });
         if (m.preErrors?.length) {
           report.errors = [...m.preErrors, ...(report.errors || [])];
         }
-        const wrongPw = (report.errors || []).some((e) => String(e).includes("密码错误"));
-        if (wrongPw) { errEl.textContent = "密码错误，请重试"; go.disabled = false; return; }
+        const wrongPw = (report.errors || []).some((e) => errCode(e) === "wrong_password" || String(e).includes("密码错误"));
+        if (wrongPw) { errEl.textContent = t("pw.errWrong"); go.disabled = false; return; }
         m.onDone?.(report);
       }
       mask.remove();
     } catch (e) {
-      errEl.textContent = typeof e === "string" ? e : String(e);
+      errEl.textContent = stripErr(e);
       go.disabled = false;
     }
   }
@@ -196,18 +197,19 @@ export function openProviderModal(m) {
   document.querySelector(".pv-mask")?.remove();
   const mask = document.createElement("div");
   mask.className = "pv-mask";
+  const displayOf = (p) => has(`prov.${p.id}`) ? t(`prov.${p.id}`) : p.display;
   mask.innerHTML = `
     <div class="pv-panel">
-      <div class="pv-title">添加账号 · 选择登录方式</div>
-      <div class="pv-sub">在弹出的窗口里自行登录（账号密码 / 扫码），<br>登录完成后自动存入账号库，<b>不影响当前正在使用的登录</b></div>
+      <div class="pv-title">${t("prov.title")}</div>
+      <div class="pv-sub">${t("prov.sub")}</div>
       <div class="pv-list">
         ${(m.providers || []).map((p) => `
           <button class="pv-item" data-id="${esc(p.id)}">
-            <span class="pv-name">${esc(p.display)}</span>
+            <span class="pv-name">${esc(displayOf(p))}</span>
             <span class="pv-arrow">→</span>
           </button>`).join("")}
       </div>
-      <div class="pv-actions"><button class="btn-ghost pv-cancel">取消</button></div>
+      <div class="pv-actions"><button class="btn-ghost pv-cancel">${t("common.cancel")}</button></div>
     </div>`;
   document.body.appendChild(mask);
   const onKey = (e) => { if (e.key === "Escape") close(); };

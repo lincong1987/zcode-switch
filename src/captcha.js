@@ -1,5 +1,6 @@
 
 import { invoke } from "@tauri-apps/api/core";
+import { init, t, lang, stripErr } from "./i18n.js";
 
 const SDK_URL = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
 const TRACELESS_TIMEOUT = 8000;
@@ -19,7 +20,7 @@ function detail(text) {
 }
 
 document.addEventListener("securitypolicyviolation", (e) => {
-  detail(`CSP 拦截 ${e.violatedDirective} ← ${String(e.blockedURI).slice(0, 70)}`);
+  detail(t("c.cspBlocked", { directive: e.violatedDirective, uri: String(e.blockedURI).slice(0, 70) }));
 });
 
 function loadSdk() {
@@ -28,7 +29,7 @@ function loadSdk() {
     const s = document.createElement("script");
     s.src = SDK_URL;
     s.onload = () => resolve();
-    s.onerror = () => reject(new Error("验证码组件加载失败，请检查网络"));
+    s.onerror = () => reject(new Error(t("c.sdkFail")));
     document.head.appendChild(s);
   });
 }
@@ -38,45 +39,54 @@ let region = null;
 let tracelessTimer = 0;
 
 async function run() {
+  try {
+    const st = await invoke("get_state");
+    if (st?.language) init(st.language);
+  } catch { /* 语言失败不阻塞验证 */ }
+  document.title = t("c.title");
+  $btn.textContent = t("c.btn");
+  document.querySelector(".cap-foot").textContent = t("c.foot");
+  status(t("c.preparing"));
+
   let cfg;
   try {
     cfg = await invoke("claim_captcha_config");
   } catch (e) {
-    status("验证配置获取失败", "err");
-    detail(String(e));
+    status(t("c.cfgFail"), "err");
+    detail(stripErr(e));
     return;
   }
   if (!cfg.enabled || !cfg.scene_id) {
-    status("验证配置不可用", "err");
-    detail("活动可能已结束，请回主窗口刷新后重试");
+    status(t("c.cfgUnavailable"), "err");
+    detail(t("c.cfgUnavailableDetail"));
     return;
   }
   region = cfg.region || null;
   try {
     await loadSdk();
   } catch (e) {
-    status(e.message || "验证码组件加载失败", "err");
+    status(e.message || t("c.sdkFail"), "err");
     return;
   }
 
   window.AliyunCaptchaConfig = { region: cfg.region, prefix: cfg.prefix };
 
-  status("正在无感验证…");
+  status(t("c.traceless"));
 
   const submit = (param) => {
     if (submitted || !param || !param.trim()) return;
     submitted = true;
     clearTimeout(tracelessTimer);
-    status("验证通过，正在领取…");
+    status(t("c.passed"));
     invoke("claim_captcha_submit", { param, region }).catch((e) => {
-      status("领取请求失败", "err");
-      detail(String(e));
+      status(t("c.claimReqFail"), "err");
+      detail(stripErr(e));
     });
   };
 
   const interactive = (why) => {
     clearTimeout(tracelessTimer);
-    status("需要人工验证，请点击下方按钮");
+    status(t("c.interactive"));
     $btn.hidden = false;
     $btn.focus();
     if (why) detail(typeof why === "string" ? why.slice(0, 120) : JSON.stringify(why).slice(0, 120));
@@ -86,7 +96,7 @@ async function run() {
     window.initAliyunCaptcha({
       SceneId: cfg.scene_id,
       mode: "popup",
-      language: "zh-CN",
+      language: lang() === "en" ? "en" : "zh-CN",
       showErrorTip: false,
       element: "#cap-holder",
       button: "#cap-btn",
@@ -103,13 +113,13 @@ async function run() {
       onError: (p) => interactive(p),
     });
   } catch (e) {
-    status("验证码初始化失败", "err");
+    status(t("c.initFail"), "err");
     detail(String(e));
   }
 }
 
 $btn.addEventListener("click", () => {
-  if (!$btn.hidden) status("请在弹窗中完成验证…");
+  if (!$btn.hidden) status(t("c.inPopup"));
 });
 
 run();

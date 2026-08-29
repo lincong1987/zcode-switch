@@ -21,8 +21,6 @@ fn parse_bool(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
-const PW_HINT: &str = "缺少密码：用环境变量 ZSW_PASSWORD（推荐，不会出现在进程列表/命令历史）或 --password <密码>";
-
 fn resolve_password(rest: &[String]) -> Option<String> {
     if let Some(p) = flag(rest, "--password") {
         return Some(p);
@@ -41,11 +39,33 @@ fn err(e: &str) -> String {
 }
 
 pub fn run(args: &[String]) -> (String, i32) {
+    let mut lang_override: Option<crate::i18n::Lang> = None;
+    let args: Vec<String> = {
+        let mut out = vec![];
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if a == "--lang" {
+                if let Some(l) = it.next().and_then(|v| crate::i18n::Lang::parse(v)) {
+                    lang_override = Some(l);
+                }
+            } else {
+                out.push(a.clone());
+            }
+        }
+        out
+    };
+    let paths = Paths::detect();
+
+    if let Some(l) = lang_override {
+        crate::i18n::set(l);
+    } else {
+        crate::i18n::init_from_settings(&load_settings(&paths));
+    }
+
     let Some(cmd) = args.first().cloned() else {
-        return (err("缺少子命令：state|list|capture|rename|delete|update|switch|quota|claim-preview|kill|export|export-all|import|behavior|setpath|launch"), 2);
+        return (err(&crate::i18n::tr("cli.missing_cmd")), 2);
     };
     let rest = &args[1..];
-    let paths = Paths::detect();
 
     let out = match cmd.as_str() {
         "state" => match get_state(&paths) {
@@ -73,7 +93,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "rename" => {
             let (Some(id), Some(name)) = (flag(rest, "--id"), flag(rest, "--name")) else {
-                return (err("用法：rename --id <id> --name <名称>"), 2);
+                return (err(&crate::i18n::tr("cli.usage.rename")), 2);
             };
             match rename_account(&paths, &id, &name) {
                 Ok(a) => ok(json!({ "id": a.id, "name": a.name })),
@@ -82,7 +102,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "delete" => {
             let Some(id) = flag(rest, "--id") else {
-                return (err("用法：delete --id <id>"), 2);
+                return (err(&crate::i18n::tr("cli.usage.delete")), 2);
             };
             match delete_account(&paths, &id) {
                 Ok(()) => ok(json!({ "deleted": id })),
@@ -91,7 +111,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "update" => {
             let Some(id) = flag(rest, "--id") else {
-                return (err("用法：update --id <id>"), 2);
+                return (err(&crate::i18n::tr("cli.usage.update")), 2);
             };
             match update_account_from_live(&paths, &id) {
                 Ok(a) => ok(json!({ "id": a.id, "name": a.name, "hash": a.hash })),
@@ -100,7 +120,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "switch" => {
             let Some(id) = flag(rest, "--id") else {
-                return (err("用法：switch --id <id> [--force] [--restart|--no-restart]"), 2);
+                return (err(&crate::i18n::tr("cli.usage.switch")), 2);
             };
             let force = has_flag(rest, "--force");
             let settings = load_settings(&paths);
@@ -125,7 +145,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "kill" => match kill_zcode() {
             Ok(true) => ok(json!({ "killed": true })),
-            Ok(false) => return (err("关闭 ZCode 超时"), 1),
+            Ok(false) => return (err(&crate::i18n::tr("err.zcode.kill_timeout")), 1),
             Err(e) => return (err(&e), 1),
         },
         "quota" => {
@@ -190,10 +210,10 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "export" => {
             let (Some(id), Some(out_path)) = (flag(rest, "--id"), flag(rest, "--out")) else {
-                return (err("用法：export --id <id> --out <file.zsb>（密码：ZSW_PASSWORD 或 --password）"), 2);
+                return (err(&crate::i18n::tr("cli.usage.export")), 2);
             };
             let Some(password) = resolve_password(rest) else {
-                return (err(PW_HINT), 2);
+                return (err(&crate::i18n::tr("cli.pw_hint")), 2);
             };
             match load_account(&paths, &id) {
                 Ok(a) => {
@@ -202,9 +222,9 @@ pub fn run(args: &[String]) -> (String, i32) {
                         Ok(sealed) => match serde_json::to_string_pretty(&sealed) {
                             Ok(body) => match atomic_write(std::path::Path::new(&out_path), &(body + "\n")) {
                                 Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
-                                Err(e) => return (err(&format!("写入失败：{e}")), 1),
+                                Err(e) => return (err(&crate::i18n::trf("err.write", &[("e", &e)])), 1),
                             },
-                            Err(e) => return (err(&format!("序列化失败：{e}")), 1),
+                            Err(e) => return (err(&crate::i18n::trf("err.serialize", &[("e", &e.to_string())])), 1),
                         },
                         Err(e) => return (err(&e), 1),
                     }
@@ -214,16 +234,16 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "export-all" => {
             let Some(out_path) = flag(rest, "--out") else {
-                return (err("用法：export-all --out <file.zsb>（密码：ZSW_PASSWORD 或 --password）"), 2);
+                return (err(&crate::i18n::tr("cli.usage.export_all")), 2);
             };
             let Some(password) = resolve_password(rest) else {
-                return (err(PW_HINT), 2);
+                return (err(&crate::i18n::tr("cli.pw_hint")), 2);
             };
             match list_accounts(&paths).map(|a| export_bundle_value(&a)) {
                 Ok(payload) => match crate::cipher::seal(&payload, &password, crate::cipher::FORMAT_BUNDLE) {
                     Ok(sealed) => match atomic_write(std::path::Path::new(&out_path), &(serde_json::to_string_pretty(&sealed).unwrap() + "\n")) {
                         Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
-                        Err(e) => return (err(&format!("写入失败：{e}")), 1),
+                        Err(e) => return (err(&crate::i18n::trf("err.write", &[("e", &e)])), 1),
                     },
                     Err(e) => return (err(&e), 1),
                 },
@@ -232,24 +252,24 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "import" => {
             let Some(file) = flag(rest, "--file") else {
-                return (err("用法：import --file <file.zsb>（密码：ZSW_PASSWORD 或 --password）"), 2);
+                return (err(&crate::i18n::tr("cli.usage.import")), 2);
             };
             let raw = match fs::read_to_string(&file) {
                 Ok(r) => r,
-                Err(e) => return (err(&format!("读取失败：{e}")), 1),
+                Err(e) => return (err(&crate::i18n::trf("cli.read_fail", &[("e", &e.to_string())])), 1),
             };
             let v: Value = match serde_json::from_str(&raw) {
                 Ok(v) => v,
-                Err(e) => return (err(&format!("JSON 解析失败：{e}")), 1),
+                Err(e) => return (err(&crate::i18n::trf("cli.json_fail", &[("e", &e.to_string())])), 1),
             };
             if !crate::cipher::is_sealed(&v) {
-                return (err("不是加密捆绑包（仅支持本工具导出的 .zsb）"), 2);
+                return (err(&crate::i18n::tr("err.import.not_sealed_plain")), 2);
             }
             if v.get("format").and_then(|f| f.as_str()) != Some(crate::cipher::FORMAT_BUNDLE) {
-                return (err("不是捆绑包格式（仅支持导出全部生成的 .zsb）"), 2);
+                return (err(&crate::i18n::tr("err.import.not_bundle_plain")), 2);
             }
             let Some(password) = resolve_password(rest) else {
-                return (err(PW_HINT), 2);
+                return (err(&crate::i18n::tr("cli.pw_hint")), 2);
             };
             let entries = match crate::cipher::open(&v, &password) {
                 Ok(payload) => vec![(file, payload)],
@@ -262,7 +282,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "setpath" => {
             let Some(p) = flag(rest, "--path") else {
-                return (err("用法：setpath --path <ZCode.exe>"), 2);
+                return (err(&crate::i18n::tr("cli.usage.setpath")), 2);
             };
             let mut s = load_settings(&paths);
             s.zcode_path = Some(p);
@@ -274,14 +294,14 @@ pub fn run(args: &[String]) -> (String, i32) {
         "launch" => {
             let (p, ok_path) = effective_zcode_path(&paths);
             if !ok_path {
-                return (err(&format!("ZCode 路径无效：{p}")), 1);
+                return (err(&crate::i18n::trf("err.zcode.path_invalid", &[("p", &p)])), 1);
             }
             match launch_zcode(&p) {
                 Ok(()) => ok(json!({ "launched": p })),
                 Err(e) => return (err(&e), 1),
             }
         }
-        other => return (err(&format!("未知子命令：{other}")), 2),
+        other => return (err(&crate::i18n::trf("cli.unknown_cmd", &[("cmd", other)])), 2),
     };
     (out, 0)
 }

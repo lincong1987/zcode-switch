@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
+import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -17,13 +18,19 @@ function notchColor(id) {
   for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return NOTCH_COLORS[h % NOTCH_COLORS.length];
 }
+
 function fmtNum(v) {
-  if (v == null) return "未知";
+  if (v == null) return t("q.unknown");
   const n = Number(v);
-  if (!isFinite(n)) return "未知";
-  if (Math.abs(n) >= 1e8) return (n / 1e8).toFixed(2) + " 亿";
-  if (Math.abs(n) >= 1e4) return (n / 1e4).toFixed(2) + " 万";
-  return n.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+  if (!isFinite(n)) return t("q.unknown");
+  if (lang() === "zh") {
+    if (Math.abs(n) >= 1e8) return (n / 1e8).toFixed(2) + " 亿";
+    if (Math.abs(n) >= 1e4) return (n / 1e4).toFixed(2) + " 万";
+    return n.toLocaleString(localeTag(), { maximumFractionDigits: 2 });
+  }
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  return n.toLocaleString(localeTag(), { maximumFractionDigits: 2 });
 }
 function idLabel(id) {
   if (!id) return null;
@@ -32,6 +39,7 @@ function idLabel(id) {
 
 async function refresh() {
   state = await invoke("get_state");
+  if (state?.language) init(state.language);
 }
 
 function uiLocked() {
@@ -44,7 +52,7 @@ async function guard(fn) {
   try {
     await fn();
   } catch (e) {
-    toast(typeof e === "string" ? e : String(e), "err");
+    toast(stripErr(e), "err");
   } finally {
     busy = false;
   }
@@ -59,7 +67,7 @@ async function loadAcctQuota(id) {
     const data = await invoke("get_account_quota", { id });
     acctQuota[id] = { data, err: null, busy: false };
   } catch (e) {
-    acctQuota[id] = { data: null, err: typeof e === "string" ? e : String(e), busy: false };
+    acctQuota[id] = { data: null, err: stripErr(e), busy: false };
   }
   if (!uiLocked()) render();
 }
@@ -92,7 +100,7 @@ const actions = {
   async capture() {
     await guard(async () => {
       const r = await invoke("capture_current", { name: null });
-      toast(`已保存当前登录为「${r.name}」`, "ok", "之后可随时切回这个账号");
+      toast(t("m.toastSaved", { name: r.name }), "ok", t("m.toastSavedDetail"));
       await refresh(); render();
       enrollAccounts();
     });
@@ -112,7 +120,7 @@ const actions = {
     clearTimeout(window.__renameBlurTimer);
     await guard(async () => {
       const r = await invoke("rename_account", { id, name });
-      toast(`已重命名为「${r.name}」`);
+      toast(t("m.toastRenamed", { name: r.name }));
       renaming = null;
       await refresh(); render();
     }).finally(() => { window.__renameSaving = false; });
@@ -133,9 +141,9 @@ const actions = {
     openConfirmModal({
       kind: "danger",
       icon: "x",
-      title: `删除「${a.name}」？`,
-      desc: "只删除账号库里的存档，不影响当前登录",
-      yesLabel: "删除",
+      title: t("m.deleteTitle", { name: a.name }),
+      desc: t("m.deleteDesc"),
+      yesLabel: t("common.delete"),
       onYes: () => actions.doDelete(id),
     });
   },
@@ -143,7 +151,7 @@ const actions = {
   async doDelete(id) {
     await guard(async () => {
       await invoke("delete_account", { id });
-      toast("账号已删除");
+      toast(t("m.toastDeleted"));
       await refresh(); render();
     });
   },
@@ -155,9 +163,9 @@ const actions = {
       openConfirmModal({
         kind: "warn",
         icon: "swap",
-        title: `切换到「${a.name}」？`,
-        desc: `<span class="warn-line">ZCode 正在运行：将自动关闭并${state.launch_after_switch ? "在切换后重启" : "不重启"}</span>（可在设置里改）`,
-        yesLabel: "强制切换",
+        title: t("m.switchTitle", { name: a.name }),
+        desc: `<span class="warn-line">${t("m.switchDesc", { restart: t(state.launch_after_switch ? "m.switchRestartYes" : "m.switchRestartNo") })}</span>`,
+        yesLabel: t("m.switchYes"),
         onYes: () => actions.doSwitch(id, true),
       });
     } else {
@@ -170,15 +178,15 @@ const actions = {
       const restart = state.launch_after_switch;
       const r = await invoke("switch_to", { id, force, restart });
       if (r.already_active) {
-        toast(`「${r.name}」已是当前登录`, "ok");
+        toast(t("m.toastAlready", { name: r.name }), "ok");
       } else {
         const bits = [];
-        if (r.hot) bits.push("热切换 · ZCode 未重启");
-        if (r.killed) bits.push("已关闭运行中的 ZCode");
-        if (r.preserved_as) bits.push(`原登录自动保存为「${r.preserved_as}」`);
-        if (r.launched) bits.push("已重新启动 ZCode");
-        if (r.config_stale) bits.push("注意：该账号无 config 快照，沿用现有 config.json（额度可能显示别的账号，登录后可点↻同步）");
-        toast(`已切换到「${r.name}」`, r.config_stale ? "warn" : "ok", bits.join("；"));
+        if (r.hot) bits.push(t("m.bitHot"));
+        if (r.killed) bits.push(t("m.bitKilled"));
+        if (r.preserved_as) bits.push(t("m.bitPreserved", { name: r.preserved_as }));
+        if (r.launched) bits.push(t("m.bitLaunched"));
+        if (r.config_stale) bits.push(t("m.bitConfigStale"));
+        toast(t("m.toastSwitched", { name: r.name }), r.config_stale ? "warn" : "ok", bits.join(t("common.listSep")));
       }
       await refresh(); render();
       pokeAccount(id);
@@ -188,7 +196,7 @@ const actions = {
   async updateFromLive(id) {
     await guard(async () => {
       const r = await invoke("update_account_from_live", { id });
-      toast(`「${r.name}」已同步当前登录`, "ok", "token 刷新后的最新状态已存档");
+      toast(t("m.toastSynced", { name: r.name }), "ok", t("m.toastSyncedDetail"));
       await refresh(); render();
     });
   },
@@ -196,7 +204,7 @@ const actions = {
   async exportOne(id) {
     await guard(async () => {
       const p = await invoke("export_pick_path", { id });
-      if (!p.picked) { toast("已取消导出"); return; }
+      if (!p.picked) { toast(t("m.exportCanceled")); return; }
       openPwModal({ mode: "export", id, path: p.path, name: p.name });
     });
   },
@@ -204,7 +212,7 @@ const actions = {
   async launch() {
     await guard(async () => {
       await invoke("launch_zcode");
-      toast("正在启动 ZCode…");
+      toast(t("m.launching"));
       setTimeout(() => actions.refresh(), 2500);
     });
   },
@@ -213,8 +221,8 @@ const actions = {
     openConfirmModal({
       kind: "danger",
       icon: "power",
-      title: "关闭 ZCode？",
-      yesLabel: "关闭",
+      title: t("m.killTitle"),
+      yesLabel: t("m.killYes"),
       onYes: () => actions.doKill(),
     });
   },
@@ -222,14 +230,14 @@ const actions = {
   async doKill() {
     await guard(async () => {
       await invoke("kill_zcode");
-      toast("已关闭 ZCode");
+      toast(t("m.toastKilled"));
       await refresh(); render();
     });
   },
 
   async openSettings() {
     try { await invoke("open_settings"); }
-    catch (e) { toast(typeof e === "string" ? e : String(e), "err"); }
+    catch (e) { toast(stripErr(e), "err"); }
   },
   acctQuota(id) {
     const dueAt = quotaDue[id];
@@ -241,32 +249,32 @@ const actions = {
   async addAccount() {
     let providers;
     try { providers = await invoke("oauth_providers"); }
-    catch (e) { toast(typeof e === "string" ? e : String(e), "err"); return; }
+    catch (e) { toast(stripErr(e), "err"); return; }
     openProviderModal({
       providers,
       onPick: async (id) => {
         try {
           await invoke("oauth_begin", { provider: id });
-          toast("登录窗口已打开", "ok", "登录完成后账号会自动入库");
+          toast(t("m.loginWindowOpened"), "ok", t("m.loginWindowDetail"));
         } catch (e) {
-          toast(typeof e === "string" ? e : String(e), "err");
+          toast(stripErr(e), "err");
         }
       },
     });
   },
 
   async claim(id) {
-    if (claimAllRunning) { toast("批量领取进行中，请等待完成", "warn"); return; }
+    if (claimAllRunning) { toast(t("m.claimBusy"), "warn"); return; }
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
-    if (!plan) { toast("该账号暂无可领取的套餐", "warn"); return; }
+    if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
     try {
       await invoke("claim_start", { id, planId: plan.plan_id });
-      toast(`正在为「${plan.name || plan.plan_id}」完成安全验证…`, "ok", "无感验证通常 2-3 秒");
+      toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
       const r = await waitForClaimResult(id);
-      if (!r) toast("验证超时或已取消", "warn");
+      if (!r) toast(t("m.claimTimeout"), "warn");
     } catch (e) {
-      toast(typeof e === "string" ? e : String(e), "err");
+      toast(stripErr(e), "err");
     }
   },
 
@@ -274,7 +282,7 @@ const actions = {
     const ids = (state?.accounts || [])
       .map((a) => a.id)
       .filter((id) => (claimable[id]?.plans || []).length > 0);
-    if (!ids.length) { toast("没有可领取的账号", "warn"); return; }
+    if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
     if (claimAllRunning) return;
     claimAllRunning = true;
     try {
@@ -285,12 +293,12 @@ const actions = {
         try {
           await invoke("claim_start", { id, planId: plan.plan_id });
         } catch (e) {
-          toast(`「${name}」${String(e)}`, "err");
+          toast(t("m.claimAccountErr", { name, err: stripErr(e) }), "err");
           continue;
         }
         const r = await waitForClaimResult(id, 120000);
         if (!r) {
-          toast(`「${name}」验证超时，已跳过`, "warn");
+          toast(t("m.claimAcctTimeout", { name }), "warn");
           await invoke("claim_cancel").catch(() => {});
         }
         if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 1200));
@@ -310,26 +318,46 @@ function quotaBarHtml(pct) {
   return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 100}%"></div><span class="qbar-pct${txtCls}">${txt}</span></div>`;
 }
 
-function shortWinLabel(name) {
-  const m = name.match(/[（(]每\s*([^）)]+)[）)]/);
+function itemKind(it) {
+  if (it.kind) return it.kind;
+  if (it.name.includes("提示次数")) return "prompt_count";
+  if (it.name.includes("使用时长")) return "duration";
+  return "raw";
+}
+function windowLabel(it) {
+  if (it.window) {
+    if (it.window.startsWith("hours:")) return t("q.win.hours", { n: it.window.slice(6) });
+    return has(`q.win.${it.window}`) ? t(`q.win.${it.window}`) : it.window;
+  }
+  const m = it.name.match(/[（(]每\s*([^）)]+)[）)]/);
   if (m) return "每" + m[1].replace(/^每/, "");
-  if (name.includes("使用时长")) return "月度";
-  if (name.includes("提示次数")) return "次数";
-  return name;
+  if (itemKind(it) === "duration") return t("q.monthlyShort");
+  if (itemKind(it) === "prompt_count") return t("q.countShort");
+  return it.name;
+}
+function resetLabel(it) {
+  if (it.reset) return t("q.resets", { time: it.reset });
+  return it.period_end || "";
 }
 
 function winRowHtml(it, cls = "") {
   return `
   <div class="q-win${cls}">
-    <span class="q-win-label">${esc(shortWinLabel(it.name))}</span>
+    <span class="q-win-label">${esc(windowLabel(it))}</span>
     ${quotaBarHtml(it.percent_used)}
-    <span class="q-win-reset" title="${esc(it.period_end || "")}">${it.period_end ? esc(it.period_end) : ""}</span>
+    <span class="q-win-reset" title="${esc(resetLabel(it))}">${it.reset || it.period_end ? esc(resetLabel(it)) : ""}</span>
   </div>`;
 }
 
 function fmtTokens(n) {
   if (n == null) return "";
-  if (n >= 1e8) return (n / 1e8).toFixed(n % 1e8 === 0 ? 0 : 1) + "亿";
+  if (lang() === "zh") {
+    if (n >= 1e8) return (n / 1e8).toFixed(n % 1e8 === 0 ? 0 : 1) + "亿";
+    if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 === 0 ? 0 : 1) + "M";
+    if (n >= 1e3) return Math.round(n / 1e3) + "K";
+    return String(Math.round(n));
+  }
+  if (n >= 1e9) return (n / 1e9).toFixed(n % 1e9 === 0 ? 0 : 1) + "B";
   if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 === 0 ? 0 : 1) + "M";
   if (n >= 1e3) return Math.round(n / 1e3) + "K";
   return String(Math.round(n));
@@ -345,43 +373,58 @@ function balRowHtml(it) {
   </div>`;
 }
 
-function tierChipHtml(t) {
-  const s = String(t).toLowerCase();
+function tierChipHtml(tier, code) {
+  const c = String(code || "").toLowerCase();
+  const s = String(tier || "").toLowerCase();
   let label, cls;
-  if (s.includes("max")) { label = "Max"; cls = "max"; }
-  else if (s.includes("pro")) { label = "Pro"; cls = "pro"; }
-  else if (s.includes("lite")) { label = "Lite"; cls = "lite"; }
-  else if (s.includes("trial") || s.includes("体验") || s.includes("start")) { label = "体验"; cls = "trial"; }
-  else { label = t; cls = "other"; }
+  if (c === "max" || (!c && s.includes("max"))) { label = "Max"; cls = "max"; }
+  else if (c === "pro" || (!c && s.includes("pro"))) { label = "Pro"; cls = "pro"; }
+  else if (c === "lite" || (!c && s.includes("lite"))) { label = "Lite"; cls = "lite"; }
+  else if (c === "start") { label = "Start"; cls = "trial"; }
+  else if (c === "trial" || (!c && (s.includes("trial") || String(tier || "").includes("体验")))) { label = t("q.trial"); cls = "trial"; }
+  else { label = tier; cls = "other"; }
   return `<span class="tier-b ${cls}">${esc(label)}</span>`;
 }
 function tierBadgeFor(id) {
   const q = acctQuota[id];
   if (!q?.data) return "";
-  const tiers = [...new Set((q.data.plans || []).map((p) => p.tier).filter(Boolean))];
-  const list = (tiers.length ? tiers : q.data.plan_tier ? [q.data.plan_tier] : []).slice(0, 2);
+  const plans = q.data.plans || [];
+  const pairs = plans.map((p) => [p.tier, p.tier_code]);
+  const list = (pairs.length ? pairs : q.data.plan_tier ? [[q.data.plan_tier, null]] : []).slice(0, 2);
   if (!list.length) return `<span class="tier-b free">Free</span>`;
-  return list.map(tierChipHtml).join("");
+  return list.map(([tier, code]) => tierChipHtml(tier, code)).join("");
 }
 
+function grantLabel(plan) {
+  const items = plan.grant_items || [];
+  if (items.length) {
+    const g = items[0];
+    return t("q.grant", {
+      name: g.name,
+      amount: fmtTokens(g.units),
+      period: t(`q.period.${g.period}`, {}) === `q.period.${g.period}` ? g.period : t(`q.period.${g.period}`, {}),
+    });
+  }
+  return (plan.grants || [])[0] || "";
+}
 function claimStripHtml(id) {
   const c = claimable[id];
   const plan = c?.plans?.[0];
   if (!plan) return "";
-  const grants = (plan.grants || []).slice(0, 1).join("、");
+  const grants = grantLabel(plan);
   const label = plan.name || plan.plan_id;
   return `
   <div class="claim-strip" title="${esc(plan.description || label)}">
     ${ic("gift", 15)}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning ? "disabled" : ""}>${ic("gift", 13)} 领取</button>
+    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
   </div>`;
 }
 
 function slotRowsHtml(items) {
   const list = items || [];
-  const isWin = (it) => it.name.includes("提示次数") || it.name.includes("使用时长");
+  const isWin = (it) => itemKind(it) !== "raw";
   const wins = list.filter(isWin);
   const best = new Map();
   for (const it of list) {
@@ -397,13 +440,13 @@ function slotRowsHtml(items) {
 }
 
 function planGroupHtml(p) {
-  const label = p.name || p.tier || "";
+  const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
   return `
   <div class="plan-grp">
     <div class="pg-head">
-      ${p.tier ? tierChipHtml(p.tier) : ""}
+      ${p.tier ? tierChipHtml(p.tier, p.tier_code) : ""}
       <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
-      ${p.expire ? `<span class="pg-exp" title="有效期至 ${esc(p.expire)}">至 ${esc(p.expire)}</span>` : ""}
+      ${p.expire ? `<span class="pg-exp" title="${esc(t("q.validUntil", { date: p.expire }))}">${esc(t("q.validUntilShort", { date: p.expire }))}</span>` : ""}
     </div>
     ${slotRowsHtml(p.items)}
   </div>`;
@@ -414,7 +457,7 @@ function acctQuotaSlot(id) {
   const q = acctQuota[id];
   let inner = "";
   if (q?.busy) {
-    inner = `<span class="aq-loading">查询中…</span>`;
+    inner = `<span class="aq-loading">${t("q.loading")}</span>`;
   } else if (q?.err) {
     const msg = q.err.length > 46 ? q.err.slice(0, 46) + "…" : q.err;
     inner = `<span class="aq-err">${esc(msg)}</span>`;
@@ -424,7 +467,7 @@ function acctQuotaSlot(id) {
       inner = plans.map(planGroupHtml).join("");
     } else {
       const items = q.data.items || [];
-      const wins = items.filter((it) => it.name.includes("提示次数"));
+      const wins = items.filter((it) => itemKind(it) === "prompt_count");
       if (wins.length) {
         inner = wins.map((it) => winRowHtml(it, " mini")).join("");
       } else {
@@ -447,10 +490,10 @@ function render() {
 
   const dotCls = s.zcode_running ? "run" : s.live_logged_in ? "" : "off";
   const statusText = s.zcode_running
-    ? "ZCode 运行中"
+    ? t("m.status.running")
     : s.live_logged_in
-      ? unsaved ? "未保存的登录" : "可安全切换"
-      : "未登录";
+      ? unsaved ? t("m.status.unsaved") : t("m.status.safe")
+      : t("m.status.loggedOut");
 
   const rows = s.accounts.map((a) => {
     const isActive = a.is_active;
@@ -460,22 +503,22 @@ function render() {
         <div class="row-main">
           <input class="rename-input" value="${esc(a.name)}" maxlength="40"
             keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">
-          <div class="row-meta">回车保存 · Esc 取消</div>
+          <div class="row-meta">${t("btn.renameMeta")}</div>
         </div>
         <div class="row-actions">
-          <button class="btn-ghost" style="padding:4px 10px" click="actions.doRename('${a.id}')">保存</button>
-          <button class="btn-ghost" style="padding:4px 10px" click="actions.cancelRename()">取消</button>
+          <button class="btn-ghost" style="padding:4px 10px" click="actions.doRename('${a.id}')">${t("common.save")}</button>
+          <button class="btn-ghost" style="padding:4px 10px" click="actions.cancelRename()">${t("common.cancel")}</button>
         </div>
       </div>`;
     }
     const ident = [a.identity?.username, a.identity?.email].filter(Boolean).join(" · ");
     const q = acctQuota[a.id];
     let meta = "";
-    if (!a.has_config) meta += `<span class="no-cfg">无 config 快照（切换后沿用现有 config）</span>`;
+    if (!a.has_config) meta += `<span class="no-cfg">${t("q.noCfg")}</span>`;
     if (q?.data?.plan_expire) {
         const days = Math.ceil((new Date(q.data.plan_expire + "T23:59:59") - Date.now()) / 86400000);
         const cls = days <= 7 ? " warn-line" : "";
-        meta += `<span class="${cls.trim()}">有效期至 ${esc(q.data.plan_expire)}</span>`;
+        meta += `<span class="${cls.trim()}">${esc(t("q.validUntil", { date: q.data.plan_expire }))}</span>`;
     }
     if (ident) meta += `${meta ? " · " : ""}${esc(ident)}`;
     return `
@@ -483,16 +526,16 @@ function render() {
       <div class="row-top">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? '<span class="tag-use">使用中</span>' : ""}</div>
+          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-actions">
-          <button class="icon-btn" title="查额度" aria-label="查额度" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
-          <button class="icon-btn" title="重命名" aria-label="重命名" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
-          <button class="icon-btn" title="导出" aria-label="导出" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
-          <button class="icon-btn danger" title="删除" aria-label="删除" click="actions.delete('${a.id}')">${ic("x", 16)}</button>
+          <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
+          <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
+          <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
+          <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 16)}</button>
           <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
-            ${isActive ? "当前" : ic("swap", 14) + " 切换"}
+            ${isActive ? t("btn.current") : ic("swap", 14) + " " + t("btn.switch")}
           </button>
         </div>
       </div>
@@ -503,8 +546,8 @@ function render() {
   const listHtml = s.accounts.length === 0
     ? `<div class="empty">
          <div class="glyph">${ic("empty", 34)}</div>
-         账号库为空<br>
-         先用下方 <b>保存当前登录</b> 存入第一个账号，或<b>导入</b>账号文件
+         ${t("m.emptyTitle")}<br>
+         ${t("m.emptyBody")}
        </div>`
     : rows;
 
@@ -521,24 +564,24 @@ function render() {
 
     <section class="toolbar">
       <button class="btn-primary has-ic${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
-        title="${active ? `当前登录已是存档「${esc(active.name)}」，无需重复保存` : ""}">
-        ${ic("capture", 16)} 保存当前登录
+        title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : ""}">
+        ${ic("capture", 16)} ${t("btn.saveLogin")}
       </button>
       ${claimableCount > 0
         ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning ? "disabled" : ""}
-            title="逐账号完成安全验证并领取（每账号限领一次）">${ic("gift", 16)} 全部领取${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
+            title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
         : ""}
-      <button class="btn-ghost has-ic" click="actions.addAccount()" title="OAuth 登录新账号入库，不影响当前登录">${ic("userPlus", 16)} 添加账号</button>
+      <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
       ${s.zcode_running
-        ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="关闭 ZCode">${ic("power", 16)} 关闭 ZCode</button>`
-        : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} 启动 ZCode</button>`}
+        ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
+        : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
       <span class="tb-spacer"></span>
-      <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="设置" title="设置">${ic("sliders", 16)}</button>
+      <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
 
     <div class="section-head">
-      <h2>ACCOUNTS · 账号库</h2>
-      <span class="count">${s.accounts.length} 个存档</span>
+      <h2>${t("m.accounts")}</h2>
+      <span class="count">${t("m.count", { count: s.accounts.length })}</span>
     </div>
 
     <main class="list">${listHtml}</main>
@@ -554,7 +597,7 @@ installDelegation();
 
 listen("tray-action", (ev) => {
   const p = ev.payload || {};
-  if (p.action === "capture" && p.ok) toast(`已保存当前登录为「${p.result.name}」`);
+  if (p.action === "capture" && p.ok) toast(t("m.toastSaved", { name: p.result.name }));
   else if (!p.ok && p.error) toast(p.error, "err");
   refresh().then(() => { if (!uiLocked()) { render(); enrollAccounts(); } }).catch(() => {});
 });
@@ -563,12 +606,12 @@ listen("claim://result", (ev) => {
   const p = ev.payload || {};
   if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
   if (p.ok === false) {
-    toast(`「${p.accountName}」领取失败：${p.message || "未知错误"}`, "err");
+    toast(t("m.claimFailed", { name: p.accountName, msg: p.message || t("m.unknownErr") }), "err");
   } else {
     const bits = [];
-    if (p.startsAt) bits.push(`额度将于 ${new Date(p.startsAt).toLocaleString("zh-CN", { hour12: false })} 生效`);
-    if (p.endsAt) bits.push(`有效期至 ${new Date(p.endsAt).toLocaleString("zh-CN", { hour12: false })}`);
-    toast(`「${p.accountName}」已领取「${p.planName}」`, "ok", bits.join("；"));
+    if (p.startsAt) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
+    if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
+    toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
   }
   if (p.accountId) {
     loadAcctQuota(p.accountId);
@@ -580,14 +623,14 @@ listen("claim://result", (ev) => {
 listen("oauth://done", (ev) => {
   const p = ev.payload || {};
   if (p.ok === false) {
-    toast(`添加账号失败：${p.error || "未知错误"}`, "err");
+    toast(t("m.oauthFail", { err: p.error || t("m.unknownErr") }), "err");
     return;
   }
   if (p.duplicate) {
-    toast(`该登录已在账号库中：「${p.name}」`, "warn", "同一账号无需重复添加；要换号请先在登录页退出登录");
+    toast(t("m.oauthDup", { name: p.name }), "warn", t("m.oauthDupDetail"));
     return;
   }
-  toast(`已添加「${p.name}」`, "ok", "不影响当前登录；需要时在列表里切换");
+  toast(t("m.oauthOk", { name: p.name }), "ok", t("m.oauthOkDetail"));
   refresh().then(() => { if (!uiLocked()) { render(); enrollAccounts(); } }).catch(() => {});
 });
 
@@ -641,11 +684,11 @@ async function sweepTick() {
     enrollAccounts();
     sweepTick();
     setInterval(() => {
-      invoke("get_state").then((s) => { state = s; enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
+      invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
   } catch (e) {
-    $app.innerHTML = `<div class="loading" style="color:var(--red)">加载失败：${esc(String(e))}</div>`;
+    $app.innerHTML = `<div class="loading" style="color:var(--red)">${t("common.loadFail", { e: esc(stripErr(e)) })}</div>`;
     invoke("reveal_main").catch(() => {});
     dismissSplash();
   }

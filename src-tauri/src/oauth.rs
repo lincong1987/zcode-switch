@@ -25,7 +25,7 @@ pub fn authorize_url(provider: &str, state: &str) -> Result<String, String> {
         "zai" => format!(
             "https://chat.z.ai/api/oauth/authorize?redirect_uri={REDIRECT_ENC}&response_type=code&client_id=client_P8X5CMWmlaRO9gyO-KSqtg&state={p}"
         ),
-        _ => return Err(format!("未知登录提供方：{provider}")),
+        _ => return Err(crate::i18n::trf("err.oauth.unknown_provider", &[("provider", provider)])),
     })
 }
 
@@ -43,12 +43,12 @@ fn urlencode(s: &str) -> String {
 pub fn parse_callback(url: &str) -> Result<(String, String), String> {
     let rest = url
         .strip_prefix("zcode://oauth/callback")
-        .ok_or("不是 OAuth 回调地址")?;
+        .ok_or_else(|| crate::i18n::tr("err.oauth.not_callback"))?;
     let qs = rest.trim_start_matches('?');
     let mut code = String::new();
     let mut state = String::new();
     for kv in qs.split('&') {
-        let (k, v) = kv.split_once('=').ok_or("回调参数格式错误")?;
+        let (k, v) = kv.split_once('=').ok_or_else(|| crate::i18n::tr("err.oauth.bad_cb"))?;
         match urldecode(k) {
             k if k == "code" => code = urldecode(v),
             k if k == "state" => state = urldecode(v),
@@ -56,7 +56,7 @@ pub fn parse_callback(url: &str) -> Result<(String, String), String> {
         }
     }
     if code.is_empty() || state.is_empty() {
-        return Err("回调缺少 code 或 state".into());
+        return Err(crate::i18n::tr("err.oauth.no_code_state"));
     }
     Ok((code, state))
 }
@@ -111,7 +111,7 @@ fn getrandom_fallback(buf: &mut [u8]) {
 pub fn parse_proxy_url(input: &str) -> Result<String, String> {
     let s = input.trim();
     if s.is_empty() {
-        return Err("代理地址不能为空".into());
+        return Err(crate::i18n::tr("err.proxy.empty"));
     }
     let lower = s.to_ascii_lowercase();
     let (scheme, rest) = if let Some(r) = lower.strip_prefix("http://") {
@@ -119,26 +119,26 @@ pub fn parse_proxy_url(input: &str) -> Result<String, String> {
     } else if let Some(r) = lower.strip_prefix("socks5://") {
         ("socks5", r)
     } else {
-        return Err("地址需以 http:// 或 socks5:// 开头（如 http://127.0.0.1:7890）".into());
+        return Err(crate::i18n::tr("err.proxy.scheme"));
     };
     if rest.contains('@') {
-        return Err("代理不支持账号密码认证，请使用免认证的本地代理".into());
+        return Err(crate::i18n::tr("err.proxy.no_auth"));
     }
     if rest.contains('/') || rest.contains('\\') {
-        return Err("代理地址不包含路径，只需 scheme://主机:端口".into());
+        return Err(crate::i18n::tr("err.proxy.no_path"));
     }
     let Some((host, port)) = rest.rsplit_once(':') else {
-        return Err("代理地址必须带端口（如 :7890）".into());
+        return Err(crate::i18n::tr("err.proxy.need_port"));
     };
     if host.is_empty() {
-        return Err("代理主机不能为空".into());
+        return Err(crate::i18n::tr("err.proxy.empty_host"));
     }
     if host.contains(' ') || host.contains(':') {
-        return Err("代理主机格式不正确".into());
+        return Err(crate::i18n::tr("err.proxy.bad_host"));
     }
-    let port_num: u32 = port.parse().map_err(|_| format!("端口“{port}”不是数字"))?;
+    let port_num: u32 = port.parse().map_err(|_| crate::i18n::trf("err.proxy.port_nan", &[("port", port)]))?;
     if !(1..=65535).contains(&port_num) {
-        return Err(format!("端口 {port_num} 超出范围（1-65535）"));
+        return Err(crate::i18n::trf("err.proxy.port_range", &[("port", &port_num.to_string())]));
     }
     Ok(format!("{scheme}://{host}:{port_num}"))
 }
@@ -162,21 +162,21 @@ pub fn exchange_token(provider: &str, code: &str, state: &str, mid: &str) -> Res
             "redirect_uri": REDIRECT_URI,
             "state": state,
         }))
-        .map_err(|e| format!("token 交换请求失败：{e}"))?
+        .map_err(|e| crate::i18n::trf("err.oauth.exchange_req", &[("e", &e.to_string())]))?
         .into_string()
-        .map_err(|e| format!("读取响应失败：{e}"))?;
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
     let code_n = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code_n != 0 {
         let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(format!("token 交换失败（{code_n}）：{msg}"));
+        return Err(crate::i18n::trf("err.oauth.exchange", &[("code", &code_n.to_string()), ("msg", msg)]));
     }
     let token = v
         .pointer("/data/token")
         .and_then(|t| t.as_str())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
-        .ok_or("token 交换成功但响应缺少 token 字段")?;
+        .ok_or_else(|| crate::i18n::tr("err.oauth.no_token"))?;
     Ok(json!({ "jwt": token, "raw": v }))
 }
 

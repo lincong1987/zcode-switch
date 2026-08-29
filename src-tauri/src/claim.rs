@@ -13,12 +13,21 @@ pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
 const CLAIM_TIMEOUT_SECS: u64 = 25;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ClaimGrant {
+    pub name: String,
+    pub units: f64,
+    pub period: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ClaimPlan {
     pub plan_id: String,
     pub name: String,
     pub description: String,
     pub priority: i64,
     pub grants: Vec<String>,
+    #[serde(default)]
+    pub grant_items: Vec<ClaimGrant>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,7 +59,7 @@ fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<St
     if let Some(t) = quota::zai_billing_token(creds, config, secret) {
         return Ok(t);
     }
-    Err("该账号缺少 zcodejwttoken 凭证，请先在 ZCode 客户端登录一次刷新".into())
+    Err(crate::i18n::tr("err.claim.no_jwt"))
 }
 
 fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
@@ -105,9 +114,9 @@ fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<Claim
     }
     let resp = req
         .call()
-        .map_err(|e| http_err("preview 请求失败", e))?
+        .map_err(|e| http_err(&crate::i18n::tr("err.claim.preview_req"), e))?
         .into_string()
-        .map_err(|e| format!("读取响应失败：{e}"))?;
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
@@ -133,7 +142,7 @@ pub fn submit_claim(
     device_mid: Option<String>,
 ) -> Result<Value, String> {
     if captcha_param.trim().is_empty() {
-        return Err("验证码参数为空，请重试".into());
+        return Err(crate::i18n::tr("err.claim.no_captcha"));
     }
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
@@ -147,9 +156,9 @@ pub fn submit_claim(
     }
     let resp = req
         .send_json(serde_json::json!({ "plan_id": plan_id }))
-        .map_err(|e| http_err("领取请求失败", e))?
+        .map_err(|e| http_err(&crate::i18n::tr("err.claim.claim_req"), e))?
         .into_string()
-        .map_err(|e| format!("读取响应失败：{e}"))?;
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
@@ -165,12 +174,12 @@ pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
     }
     let resp = req
         .call()
-        .map_err(|e| format!("配置请求失败：{e}"))?
+        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e.to_string())]))?
         .into_string()
-        .map_err(|e| format!("读取响应失败：{e}"))?;
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
     if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
-        return Err("验证码配置不可用".into());
+        return Err(crate::i18n::tr("err.claim.config_unavailable"));
     }
     let c = v.pointer("/data/configs/captcha").cloned().unwrap_or(Value::Null);
     let s = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
@@ -199,7 +208,7 @@ fn parse_plan(p: &Value) -> Option<ClaimPlan> {
     if plan_id.is_empty() {
         return None;
     }
-    let grants = p
+    let grant_items: Vec<ClaimGrant> = p
         .get("entitlements")
         .and_then(|e| e.as_array())
         .map(|arr| {
@@ -211,21 +220,26 @@ fn parse_plan(p: &Value) -> Option<ClaimPlan> {
                             .map(|s| !s.trim().is_empty())
                             .unwrap_or(false)
                 })
-                .map(|e| {
-                    let name = str_field(e, "show_name", "showName").unwrap_or("");
-                    let units = num_field(e, "grant_units", "grantUnits").unwrap_or(0.0);
-                    let period = str_field(e, "period", "period").unwrap_or("");
-                    let period_cn = match period {
-                        "daily" => "每日",
-                        "weekly" => "每周",
-                        "monthly" => "每月",
-                        _ => "一次性",
-                    };
-                    format!("{name} · {} Token（{period_cn}）", fmt_units(units))
+                .map(|e| ClaimGrant {
+                    name: str_field(e, "show_name", "showName").unwrap_or("").to_string(),
+                    units: num_field(e, "grant_units", "grantUnits").unwrap_or(0.0),
+                    period: str_field(e, "period", "period").unwrap_or("one_time").to_string(),
                 })
                 .collect()
         })
         .unwrap_or_default();
+    let grants = grant_items
+        .iter()
+        .map(|g| {
+            let period_cn = match g.period.as_str() {
+                "daily" => "每日",
+                "weekly" => "每周",
+                "monthly" => "每月",
+                _ => "一次性",
+            };
+            format!("{} · {} Token（{period_cn}）", g.name, fmt_units(g.units))
+        })
+        .collect();
     Some(ClaimPlan {
         name: p.get("name").and_then(|s| s.as_str()).unwrap_or("").trim().to_string(),
         description: p
@@ -237,6 +251,7 @@ fn parse_plan(p: &Value) -> Option<ClaimPlan> {
         priority: p.get("priority").and_then(|x| x.as_i64()).unwrap_or(0),
         plan_id,
         grants,
+        grant_items,
     })
 }
 
@@ -263,18 +278,22 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         .iter()
         .find_map(|k| body.get(k).and_then(|x| x.as_str()).map(String::from))
         .unwrap_or_default();
-    let base = match code {
-        1001 => "套餐不存在",
-        1002 => "活动已结束或套餐暂不可领取",
-        1003 => "该套餐已经领取过",
-        1004 => "不符合领取条件",
-        1005 => "今日领取名额已用完",
-        3001 => "领取参数错误，请刷新后重试",
-        3007 => "验证码校验失败，请重试",
-        401 => "请先登录后再领取",
-        _ => "领取失败",
-    };
-    if server_msg.is_empty() { base.into() } else { format!("{base}（{server_msg}）") }
+    let base = crate::i18n::tr(match code {
+        1001 => "claim.fail.1001",
+        1002 => "claim.fail.1002",
+        1003 => "claim.fail.1003",
+        1004 => "claim.fail.1004",
+        1005 => "claim.fail.1005",
+        3001 => "claim.fail.3001",
+        3007 => "claim.fail.3007",
+        401 => "claim.fail.401",
+        _ => "claim.fail.generic",
+    });
+    if server_msg.is_empty() {
+        base
+    } else {
+        crate::i18n::trf("claim.fail.with_server", &[("base", &base), ("server_msg", &server_msg)])
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +319,10 @@ mod tests {
         assert_eq!(p.plan_id, "zcode-v3-start-plan-0828");
         assert_eq!(p.priority, 100);
         assert_eq!(p.grants, vec!["GLM-5.3-Flash · 3亿 Token（一次性）".to_string()]);
+        assert_eq!(p.grant_items.len(), 1);
+        assert_eq!(p.grant_items[0].name, "GLM-5.3-Flash");
+        assert_eq!(p.grant_items[0].units, 300000000.0);
+        assert_eq!(p.grant_items[0].period, "one_time");
     }
 
     #[test]

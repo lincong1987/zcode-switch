@@ -19,19 +19,19 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
 
 pub fn seal(payload: &Value, password: &str, format: &str) -> Result<Value, String> {
     if password.trim().is_empty() {
-        return Err("密码不能为空（导出文件包含登录凭据，必须加密）".into());
+        return Err(crate::i18n::tr("err.cipher.pw_empty"));
     }
     let mut salt = [0u8; 16];
     let mut nonce_b = [0u8; 12];
     aes_gcm::aead::OsRng.fill_bytes(&mut salt);
     aes_gcm::aead::OsRng.fill_bytes(&mut nonce_b);
 
-    let plain = serde_json::to_vec(payload).map_err(|e| format!("序列化失败：{e}"))?;
+    let plain = serde_json::to_vec(payload).map_err(|e| crate::i18n::trf("err.serialize", &[("e", &e.to_string())]))?;
     let key = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("密钥错误：{e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| crate::i18n::trf("err.cipher.key", &[("e", &e.to_string())]))?;
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce_b), plain.as_slice())
-        .map_err(|e| format!("加密失败：{e}"))?;
+        .map_err(|e| crate::i18n::trf("err.cipher.encrypt", &[("e", &e.to_string())]))?;
     let (data, tag) = ct.split_at(ct.len() - 16);
 
     Ok(json!({
@@ -43,28 +43,28 @@ pub fn seal(payload: &Value, password: &str, format: &str) -> Result<Value, Stri
 }
 
 pub fn open(envelope: &Value, password: &str) -> Result<Value, String> {
-    let kdf = envelope.get("kdf").ok_or("文件缺少 kdf 段（不是有效的加密导出）")?;
-    let c = envelope.get("cipher").ok_or("文件缺少 cipher 段")?;
+    let kdf = envelope.get("kdf").ok_or_else(|| crate::i18n::tr("err.cipher.no_kdf"))?;
+    let c = envelope.get("cipher").ok_or_else(|| crate::i18n::tr("err.cipher.no_cipher"))?;
     let salt = B64.decode(kdf.get("salt").and_then(|v| v.as_str()).unwrap_or_default())
-        .map_err(|_| "salt 解码失败")?;
+        .map_err(|_| crate::i18n::tr("err.cipher.bad_salt"))?;
     let nonce_b = B64.decode(c.get("nonce").and_then(|v| v.as_str()).unwrap_or_default())
-        .map_err(|_| "nonce 解码失败")?;
+        .map_err(|_| crate::i18n::tr("err.cipher.bad_nonce"))?;
     let tag = B64.decode(c.get("tag").and_then(|v| v.as_str()).unwrap_or_default())
-        .map_err(|_| "tag 解码失败")?;
+        .map_err(|_| crate::i18n::tr("err.cipher.bad_tag"))?;
     let data = B64.decode(c.get("data").and_then(|v| v.as_str()).unwrap_or_default())
-        .map_err(|_| "数据解码失败")?;
+        .map_err(|_| crate::i18n::tr("err.cipher.bad_data"))?;
     if nonce_b.len() != 12 {
-        return Err("nonce 长度异常".into());
+        return Err(crate::i18n::tr("err.cipher.nonce_len"));
     }
 
     let key = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("密钥错误：{e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| crate::i18n::trf("err.cipher.key", &[("e", &e.to_string())]))?;
     let mut buf = data.clone();
     buf.extend_from_slice(&tag);
     let plain = cipher
         .decrypt(Nonce::from_slice(&nonce_b), buf.as_slice())
-        .map_err(|_| "密码错误或文件已损坏".to_string())?;
-    serde_json::from_slice(&plain).map_err(|e| format!("解密后内容异常：{e}"))
+        .map_err(|_| crate::i18n::coded("wrong_password", "err.cipher.wrong_pw", &[]))?;
+    serde_json::from_slice(&plain).map_err(|e| crate::i18n::trf("err.cipher.bad_plain", &[("e", &e.to_string())]))
 }
 
 pub fn is_sealed(v: &Value) -> bool {

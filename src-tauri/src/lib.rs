@@ -1,5 +1,6 @@
 pub mod cipher;
 pub mod cli;
+pub mod i18n;
 mod claim;
 mod oauth;
 mod quota;
@@ -61,20 +62,20 @@ fn tray_menu_inner(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
         Err(e) => {
             eprintln!("tray state error: {e}");
             return MenuBuilder::new(app)
-                .item(&MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?)
-                .item(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)
+                .item(&MenuItem::with_id(app, "show", &i18n::tr("tray.show"), true, None::<&str>)?)
+                .item(&MenuItem::with_id(app, "quit", &i18n::tr("tray.quit"), true, None::<&str>)?)
                 .build();
         }
     };
 
     let b = MenuBuilder::new(app)
-        .item(&MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?)
-        .item(&MenuItem::with_id(app, "capture", "保存当前登录", state.live_logged_in, None::<&str>)?)
+        .item(&MenuItem::with_id(app, "show", &i18n::tr("tray.show"), true, None::<&str>)?)
+        .item(&MenuItem::with_id(app, "capture", &i18n::tr("tray.capture"), state.live_logged_in, None::<&str>)?)
         .separator()
-        .item(&MenuItem::with_id(app, "launch", "启动 ZCode", state.zcode_path_ok && !state.zcode_running, None::<&str>)?)
-        .item(&MenuItem::with_id(app, "kill", "关闭 ZCode", state.zcode_running, None::<&str>)?)
+        .item(&MenuItem::with_id(app, "launch", &i18n::tr("tray.launch"), state.zcode_path_ok && !state.zcode_running, None::<&str>)?)
+        .item(&MenuItem::with_id(app, "kill", &i18n::tr("tray.kill"), state.zcode_running, None::<&str>)?)
         .separator()
-        .item(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?);
+        .item(&MenuItem::with_id(app, "quit", &i18n::tr("tray.quit"), true, None::<&str>)?);
     b.build()
 }
 
@@ -91,7 +92,7 @@ pub fn rebuild_tray(app: &AppHandle) {
                         .find(|a| a.is_active)
                         .map(|a| a.name.clone())
                         .or_else(|| s.live_identity.as_ref().and_then(|i| i.label()))
-                        .unwrap_or_else(|| if s.live_logged_in { "未保存的登录".into() } else { "未登录".into() });
+                        .unwrap_or_else(|| if s.live_logged_in { i18n::tr("tray.unsaved") } else { i18n::tr("tray.logged_out") });
                     format!("Z·SWITCH · {cur}")
                 }
                 Err(_) => "Z·SWITCH".into(),
@@ -124,11 +125,11 @@ fn run_tray_action(app: AppHandle, action: String) {
             "capture" => store::capture_current(&paths, None).map(|a| json!({ "name": a.name })),
             "launch" => {
                 let (p, ok) = effective_zcode_path(&paths);
-                if ok { store::launch_zcode(&p).map(|_| json!({})) } else { Err(format!("ZCode 路径无效：{p}")) }
+                if ok { store::launch_zcode(&p).map(|_| json!({})) } else { Err(i18n::trf("err.zcode.path_invalid", &[("p", &p)])) }
             }
             "kill" => match store::kill_zcode() {
                 Ok(true) => Ok(json!({})),
-                Ok(false) => Err("关闭 ZCode 超时".into()),
+                Ok(false) => Err(i18n::tr("err.zcode.kill_timeout")),
                 Err(e) => Err(e),
             },
             _ => Ok(json!({})),
@@ -222,7 +223,7 @@ async fn claim_start(app: AppHandle, id: String, plan_id: String) -> Result<serd
     let plan = plans
         .iter()
         .find(|p| p.plan_id == plan_id)
-        .ok_or_else(|| "该套餐已不可领取，请刷新".to_string())?;
+        .ok_or_else(|| i18n::tr("err.claim.gone"))?;
     let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
 
     *pending_guard() = Some(PendingClaim {
@@ -249,7 +250,7 @@ async fn claim_captcha_submit(
     param: String,
     region: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let pending = pending_guard().take().ok_or("没有待领取的套餐")?;
+    let pending = pending_guard().take().ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
     let paths = Paths::detect();
     let res = claim::submit_claim(
         &paths.home,
@@ -330,12 +331,12 @@ async fn oauth_providers() -> Result<Vec<oauth::OAuthProvider>, String> {
 #[tauri::command]
 async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Value, String> {
     if !oauth::OAUTH_PROVIDERS.iter().any(|p| p.id == provider) {
-        return Err(format!("未知登录提供方：{provider}"));
+        return Err(i18n::trf("err.oauth.unknown_provider", &[("provider", &provider)]));
     }
     let proxy_url: Option<tauri::Url> = match load_settings(&Paths::detect()).auth_proxy() {
         Some(p) => {
             let norm = oauth::parse_proxy_url(p)?;
-            Some(norm.parse().map_err(|e| format!("代理地址无效：{e}"))?)
+            Some(norm.parse::<tauri::Url>().map_err(|e| i18n::trf("err.proxy.invalid", &[("e", &e.to_string())]))?)
         }
         None => None,
     };
@@ -351,7 +352,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     let login_root = app
         .path()
         .app_local_data_dir()
-        .map_err(|e| format!("无法定位应用数据目录：{e}"))?
+        .map_err(|e| i18n::trf("err.oauth.appdata", &[("e", &e.to_string())]))?
         .join("login-webview");
     sweep_login_profiles(&login_root);
     let profile_dir = login_root.join(&flow);
@@ -361,9 +362,9 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "login",
-        tauri::WebviewUrl::External(url.parse().map_err(|e| format!("authorize URL 非法：{e}"))?),
+        tauri::WebviewUrl::External(url.parse::<tauri::Url>().map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?),
     )
-    .title("登录 ZCode 账号")
+    .title(i18n::tr("title.login"))
     .theme(Some(tauri::Theme::Dark))
     .inner_size(480.0, 680.0)
     .min_inner_size(420.0, 560.0)
@@ -388,7 +389,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     .build()
     .map_err(|e| {
         *pending_oauth_guard() = None;
-        format!("登录窗口创建失败：{e}")
+        i18n::trf("err.oauth.window", &[("e", &e.to_string())])
     })?;
     Ok(json!({ "opened": true, "provider": provider }))
 }
@@ -415,7 +416,7 @@ async fn set_auth_proxy(app: AppHandle, on: bool, url: Option<String>) -> Result
             None => None,
         };
         if on && normalized.is_none() {
-            return Err("开启代理前请先填写代理地址（http:// 或 socks5://）".into());
+            return Err(i18n::tr("err.proxy.need_url"));
         }
         let mut s = load_settings(&paths);
         s.auth_proxy_on = Some(on);
@@ -449,7 +450,7 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
             }
             let (code, cb_state) = oauth::parse_callback(&callback_url)?;
             if cb_state != state {
-                return Err("OAuth state 校验失败，请重新发起登录".into());
+                return Err(i18n::tr("err.oauth.state"));
             }
             let mid = uuid::Uuid::new_v4().to_string();
             let exchanged = oauth::exchange_token(&provider, &code, &state, &mid)?;
@@ -481,8 +482,8 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .and_then(|u| u.get("username").and_then(|x| x.as_str()).map(String::from))
                 .unwrap_or_else(|| match provider.as_str() {
-                    "zai" => "z.ai 账号".into(),
-                    _ => "BigModel 账号".into(),
+                    "zai" => "z.ai".to_string(),
+                    _ => "BigModel".to_string(),
                 });
             let name = unique_name(&accounts, &base);
             let ts = now_ts();
@@ -504,7 +505,7 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
             Ok(json!({ "id": acc.id, "name": acc.name, "provider": provider }))
         })
         .await
-        .unwrap_or_else(|e| Err(format!("登录流程异常：{e}")))
+        .unwrap_or_else(|e| Err(i18n::trf("err.oauth.flow", &[("e", &e.to_string())])))
     };
 
     if let Err(e) = &result {
@@ -536,7 +537,7 @@ fn open_captcha_window(app: &AppHandle) -> Result<(), String> {
         "captcha",
         tauri::WebviewUrl::App("captcha.html".into()),
     )
-    .title("安全验证")
+    .title(i18n::tr("title.captcha"))
     .theme(Some(tauri::Theme::Dark))
     .background_color(tauri::window::Color(10, 10, 12, 255))
     .inner_size(w, h)
@@ -556,7 +557,7 @@ fn open_captcha_window(app: &AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn kill_zcode(app: AppHandle) -> Result<(), String> {
     let _guard = store_guard();
-    let r = if store::kill_zcode()? { Ok(()) } else { Err("关闭 ZCode 超时".into()) };
+    let r = if store::kill_zcode()? { Ok(()) } else { Err(i18n::tr("err.zcode.kill_timeout")) };
     rebuild_tray(&app);
     r
 }
@@ -587,8 +588,30 @@ async fn set_behavior(
 }
 
 #[tauri::command]
+async fn set_language(app: AppHandle, lang: String) -> Result<(), String> {
+    let l = i18n::Lang::parse(&lang)
+        .ok_or_else(|| i18n::trf("err.lang.unknown", &[("lang", &lang)]))?;
+    {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        let mut s = load_settings(&paths);
+        s.language = Some(l.as_str().to_string());
+        save_settings(&paths, &s)?;
+    }
+    i18n::set(l);
+    rebuild_tray(&app);
+    for (label, key) in [("settings", "title.settings"), ("captcha", "title.captcha"), ("login", "title.login")] {
+        if let Some(w) = app.get_webview_window(label) {
+            let _ = w.set_title(&i18n::tr(key));
+        }
+    }
+    let _ = app.emit("state-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
 async fn reveal_main(app: AppHandle) -> Result<(), String> {
-    let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    let win = app.get_webview_window("main").ok_or_else(|| i18n::tr("err.main.missing"))?;
     win.show().map_err(|e| e.to_string())?;
     let _ = win.set_focus();
     Ok(())
@@ -609,7 +632,7 @@ async fn open_settings(app: AppHandle) -> Result<(), String> {
         "settings",
         tauri::WebviewUrl::App("settings.html".into()),
     )
-    .title("Z·SWITCH 设置")
+    .title(i18n::tr("title.settings"))
     .theme(Some(tauri::Theme::Dark))
     .background_color(tauri::window::Color(10, 10, 12, 255))
     .inner_size(w, h)
@@ -659,13 +682,13 @@ async fn export_pick_path(app: AppHandle, id: String) -> Result<serde_json::Valu
     let picked = app
         .dialog()
         .file()
-        .add_filter("ZSwitch 加密捆绑包（.zsb）", &["zsb"])
+        .add_filter(&i18n::tr("dialog.zsb"), &["zsb"])
         .set_file_name(&default_name)
         .blocking_save_file();
     let Some(fp) = picked else {
         return Ok(json!({ "picked": false }));
     };
-    let path = fp.into_path().map_err(|e| format!("路径无效：{e}"))?;
+    let path = fp.into_path().map_err(|e| i18n::trf("err.path.invalid", &[("e", &e.to_string())]))?;
     Ok(json!({ "picked": true, "path": path.to_string_lossy(), "name": acc.name }))
 }
 
@@ -675,7 +698,7 @@ async fn export_finalize(path: String, id: String, password: String) -> Result<s
     let payload = store::export_bundle_value(std::slice::from_ref(&acc));
     let sealed = cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?;
     let body = serde_json::to_string_pretty(&sealed).unwrap() + "\n";
-    store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| format!("写入失败：{e}"))?;
+    store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
     Ok(json!({ "saved": true, "path": path }))
 }
 
@@ -683,18 +706,18 @@ async fn export_finalize(path: String, id: String, password: String) -> Result<s
 async fn export_all_pick_path(app: AppHandle) -> Result<serde_json::Value, String> {
     let accounts = list_accounts(&Paths::detect())?;
     if accounts.is_empty() {
-        return Err("账号库为空，没有可导出的内容".into());
+        return Err(i18n::tr("err.export.empty"));
     }
     let picked = app
         .dialog()
         .file()
-        .add_filter("ZSwitch 加密捆绑包（.zsb）", &["zsb"])
+        .add_filter(&i18n::tr("dialog.zsb"), &["zsb"])
         .set_file_name("zcode-accounts.zsb")
         .blocking_save_file();
     let Some(fp) = picked else {
         return Ok(json!({ "picked": false }));
     };
-    let path = fp.into_path().map_err(|e| format!("路径无效：{e}"))?;
+    let path = fp.into_path().map_err(|e| i18n::trf("err.path.invalid", &[("e", &e.to_string())]))?;
     Ok(json!({ "picked": true, "path": path.to_string_lossy(), "count": accounts.len() }))
 }
 
@@ -702,12 +725,12 @@ async fn export_all_pick_path(app: AppHandle) -> Result<serde_json::Value, Strin
 async fn export_all_finalize(path: String, password: String) -> Result<serde_json::Value, String> {
     let accounts = list_accounts(&Paths::detect())?;
     if accounts.is_empty() {
-        return Err("账号库为空".into());
+        return Err(i18n::tr("err.export.empty_short"));
     }
     let payload = store::export_bundle_value(&accounts);
     let sealed = cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?;
     let body = serde_json::to_string_pretty(&sealed).unwrap() + "\n";
-    store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| format!("写入失败：{e}"))?;
+    store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
     Ok(json!({ "saved": true, "path": path, "count": accounts.len() }))
 }
 
@@ -716,7 +739,7 @@ async fn import_pick_files(app: AppHandle) -> Result<serde_json::Value, String> 
     let picked = app
         .dialog()
         .file()
-        .add_filter("ZSwitch 加密捆绑包（.zsb）", &["zsb"])
+        .add_filter(&i18n::tr("dialog.zsb"), &["zsb"])
         .blocking_pick_files();
     let Some(files) = picked else {
         return Ok(json!({ "picked": false }));
@@ -727,7 +750,7 @@ async fn import_pick_files(app: AppHandle) -> Result<serde_json::Value, String> 
         let path = match fp.into_path() {
             Ok(p) => p,
             Err(e) => {
-                errors.push(format!("路径错误：{e}"));
+                errors.push(i18n::trf("err.path.conv", &[("e", &e.to_string())]));
                 continue;
             }
         };
@@ -735,21 +758,21 @@ async fn import_pick_files(app: AppHandle) -> Result<serde_json::Value, String> 
         let raw = match std::fs::read_to_string(&path) {
             Ok(r) => r,
             Err(e) => {
-                errors.push(format!("{fname}：读取失败 {e}"));
+                errors.push(i18n::trf("err.import.read", &[("fname", fname.as_str()), ("e", &e.to_string())]));
                 continue;
             }
         };
         match serde_json::from_str::<Value>(&raw) {
             Ok(v) => {
                 if !cipher::is_sealed(&v) {
-                    errors.push(format!("{fname}：不是加密捆绑包（仅支持本工具导出的 .zsb）"));
+                    errors.push(i18n::trf("err.import.not_sealed", &[("fname", fname.as_str())]));
                 } else if v.get("format").and_then(|f| f.as_str()) != Some(cipher::FORMAT_BUNDLE) {
-                    errors.push(format!("{fname}：不是捆绑包格式（仅支持导出全部生成的 .zsb）"));
+                    errors.push(i18n::trf("err.import.not_bundle", &[("fname", fname.as_str())]));
                 } else {
                     sealed.push((fname, v));
                 }
             }
-            Err(e) => errors.push(format!("{fname}：JSON 解析失败 {e}")),
+            Err(e) => errors.push(i18n::trf("err.import.json", &[("fname", fname.as_str()), ("e", &e.to_string())])),
         }
     }
     Ok(json!({ "picked": true, "sealed": sealed, "errors": errors }))
@@ -763,7 +786,7 @@ async fn import_sealed(app: AppHandle, files: Vec<(String, Value)>, password: St
     for (fname, v) in files {
         match cipher::open(&v, &password) {
             Ok(payload) => decrypted.push((fname, payload)),
-            Err(e) => errors.push(format!("{fname}：{e}")),
+            Err(e) => errors.push(i18n::trf("err.import.wrap", &[("fname", fname.as_str()), ("e", &e)])),
         }
     }
     let mut report = if decrypted.is_empty() {
@@ -782,12 +805,12 @@ async fn pick_zcode_path(app: AppHandle) -> Result<serde_json::Value, String> {
     let picked = app
         .dialog()
         .file()
-        .add_filter("ZCode 可执行文件", &["exe"])
+        .add_filter(&i18n::tr("dialog.exe"), &["exe"])
         .blocking_pick_file();
     let Some(fp) = picked else {
         return Ok(json!({ "picked": false }));
     };
-    let path = fp.into_path().map_err(|e| format!("路径无效：{e}"))?;
+    let path = fp.into_path().map_err(|e| i18n::trf("err.path.invalid", &[("e", &e.to_string())]))?;
     Ok(json!({ "picked": true, "path": path.to_string_lossy() }))
 }
 
@@ -808,7 +831,7 @@ async fn launch_zcode(app: AppHandle) -> Result<(), String> {
     let paths = Paths::detect();
     let (p, ok) = effective_zcode_path(&paths);
     if !ok {
-        return Err(format!("ZCode 路径无效：{p}（在设置里修改）"));
+        return Err(i18n::trf("err.zcode.path_invalid_hint", &[("p", &p)]));
     }
     let r = store::launch_zcode(&p);
     rebuild_tray(&app);
@@ -845,6 +868,7 @@ pub fn run() {
             set_auth_proxy,
             kill_zcode,
             set_behavior,
+            set_language,
             autostart_status,
             autostart_set,
             export_pick_path,
@@ -877,6 +901,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            i18n::init_from_settings(&store::load_settings(&Paths::detect()));
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().expect("no window icon").clone())
                 .tooltip("Z·SWITCH")
