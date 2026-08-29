@@ -11,9 +11,29 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+fn no_window(prog: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = std::process::Command::new(prog);
+    c.creation_flags(0x0800_0000);
+    c
+}
+#[cfg(not(windows))]
+fn no_window(prog: &str) -> std::process::Command {
+    std::process::Command::new(prog)
+}
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+fn detached(mut c: std::process::Command) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    c.creation_flags(0x0000_0008 | 0x0000_0200);
+    c
+}
+#[cfg(not(windows))]
+fn detached(c: std::process::Command) -> std::process::Command {
+    use std::process::Stdio;
+    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+}
 
 pub struct Paths {
     pub home: PathBuf,
@@ -209,9 +229,8 @@ pub fn zcode_running() -> bool {
     if in_sandbox() {
         return false;
     }
-    let out = Command::new("tasklist")
+    let out = no_window("tasklist")
         .args(["/FI", "IMAGENAME eq ZCode.exe", "/FO", "CSV", "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
         .output();
     match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
@@ -228,9 +247,8 @@ pub fn kill_zcode() -> Result<bool, String> {
     if !zcode_running() {
         return Ok(true);
     }
-    let _ = Command::new("taskkill")
+    let _ = no_window("taskkill")
         .args(["/F", "/IM", "ZCode.exe"])
-        .creation_flags(CREATE_NO_WINDOW)
         .output();
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
@@ -250,8 +268,7 @@ pub fn launch_zcode(path: &str) -> Result<(), String> {
     if !p.exists() {
         return Err(format!("ZCode 不存在：{path}（在设置里修改路径）"));
     }
-    Command::new(&p)
-        .creation_flags(0x0000_0008 | 0x0000_0200)
+    detached(Command::new(&p))
         .spawn()
         .map_err(|e| format!("启动失败：{e}"))?;
     Ok(())
