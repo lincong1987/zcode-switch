@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-windows:
+    name: Build & Release (windows)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build Tauri & upload release assets
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Z·SWITCH ${{ github.ref_name }}'
+          releaseBody: '见 [README](https://github.com/${{ github.repository }}/blob/main/README.md) 了解完整功能。下载：`*_x64-setup.exe` 安装包（推荐） / `*_portable.exe` 便携版。未签名，首次运行 SmartScreen 选「更多信息 → 仍要运行」。'
+          releaseDraft: false
+          prerelease: false
+
+      - name: Upload portable exe + checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          cp "src-tauri/target/release/zcode-switch.exe" "zcode-switch_${VER}_portable.exe"
+          SETUP=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe | head -1)
+          sha256sum "zcode-switch_${VER}_portable.exe" "$SETUP" | sed "s| .*/| |" > "checksums-${GITHUB_REF_NAME}.txt"
+          gh release upload "$GITHUB_REF_NAME" "zcode-switch_${VER}_portable.exe" "checksums-${GITHUB_REF_NAME}.txt" --clobber
