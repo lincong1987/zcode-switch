@@ -45,5 +45,12 @@ jobs:
           workspaces: src-tauri
 
       - name: cargo check
-        run: cargo check --lib
-        working-directory: src-tauri
+        shell: bash
+        run: |
+          cd src-tauri
+          cargo check --lib 2>&1 | tee check.log
+          code=${PIPESTATUS[0]}
+          if [ $code -ne 0 ]; then
+            grep -E '^error' check.log | head -6 | sed 's/^/::error:: /'
+          fi
+          exit $code
