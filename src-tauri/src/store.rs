@@ -30,9 +30,10 @@ fn detached(mut c: std::process::Command) -> std::process::Command {
     c
 }
 #[cfg(not(windows))]
-fn detached(c: std::process::Command) -> std::process::Command {
+fn detached(mut c: std::process::Command) -> std::process::Command {
     use std::process::Stdio;
-    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    c
 }
 
 pub struct Paths {
