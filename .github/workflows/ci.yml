@@ -67,7 +67,3 @@ jobs:
           git add "check-${RUNNER_OS}.log"
           git commit -qm "ci log ${GITHUB_SHA}"
           git push -q origin HEAD:ci-logs --force
-
-      - name: cargo check
-        run: cargo check --lib
-        working-directory: src-tauri
