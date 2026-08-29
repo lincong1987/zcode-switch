@@ -29,6 +29,16 @@ fn pick_username(username: Option<&str>, user: Option<&str>, logname: Option<&st
         .to_string()
 }
 
+#[cfg(not(windows))]
+fn passwd_username() -> Option<String> {
+    let out = std::process::Command::new("id")
+        .arg("-un")
+        .output()
+        .ok()?;
+    let n = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!n.is_empty()).then_some(n)
+}
+
 fn compose_fallback_secret(platform: &str, home: &str, username: &str) -> String {
     format!("zcode-credential-fallback:{}:{}:{}", platform, home, username)
 }
@@ -37,8 +47,12 @@ pub fn default_secret(home: &Path) -> String {
     if let Ok(s) = std::env::var("ZCODE_CREDENTIAL_SECRET") {
         return s;
     }
+    #[cfg(windows)]
+    let primary = std::env::var("USERNAME").ok();
+    #[cfg(not(windows))]
+    let primary = passwd_username().or_else(|| std::env::var("USER").ok());
     let username = pick_username(
-        std::env::var("USERNAME").ok().as_deref(),
+        primary.as_deref(),
         std::env::var("USER").ok().as_deref(),
         std::env::var("LOGNAME").ok().as_deref(),
     );

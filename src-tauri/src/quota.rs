@@ -40,10 +40,12 @@ pub(crate) fn device_mid() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let home = std::env::var("ZCODE_SWITCH_HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_default();
-            let p = std::path::Path::new(&home).join(".zcode").join("v2").join("telemetry-state.json");
+            let home = crate::store::pick_home(
+                std::env::var("ZCODE_SWITCH_HOME").ok().map(std::path::PathBuf::from),
+                std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
+                std::env::var("HOME").ok().map(std::path::PathBuf::from),
+            );
+            let p = home.join(".zcode").join("v2").join("telemetry-state.json");
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -52,6 +54,7 @@ pub(crate) fn device_mid() -> Option<String> {
         .clone()
 }
 
+#[cfg(windows)]
 fn os_version() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
@@ -68,6 +71,19 @@ fn os_version() -> Option<String> {
         .clone()
 }
 
+#[cfg(not(windows))]
+fn os_version() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let out = no_window("uname").arg("-r").output().ok()?;
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!v.is_empty()).then_some(v)
+        })
+        .clone()
+}
+
+#[cfg(windows)]
 fn client_timezone() -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE
@@ -87,6 +103,11 @@ fn client_timezone() -> String {
             .to_string()
         })
         .clone()
+}
+
+#[cfg(not(windows))]
+fn client_timezone() -> String {
+    iana_time_zone::get_timezone().unwrap_or_else(|_| "unknown".to_string())
 }
 
 pub(crate) fn zcode_app_version() -> String {
@@ -1640,6 +1661,8 @@ mod tests {
         assert_eq!(h[1].1, "https://zcode.z.ai");
         assert_eq!(h[2].1, "Z Code@electron");
         assert_eq!(h[4].1, client_platform());
+        #[cfg(windows)]
+        assert_eq!(h[4].1, "win32-x64");
         assert_eq!(h[5].1, "stable");
         assert_eq!(h[6].1, "zh-CN");
         let os_cat = h.iter().find(|(k, _)| k == "X-Os-Category").unwrap();

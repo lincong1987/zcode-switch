@@ -42,7 +42,7 @@ pub struct Paths {
     pub home: PathBuf,
 }
 
-fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, home_env: Option<PathBuf>) -> PathBuf {
+pub(crate) fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, home_env: Option<PathBuf>) -> PathBuf {
     zswitch
         .or(userprofile)
         .or(home_env)
@@ -297,7 +297,19 @@ pub fn kill_zcode() -> Result<bool, String> {
     for name in ["zcode", "ZCode"] {
         let _ = no_window("pkill").args(["-x", name]).output();
     }
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let soft_deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < soft_deadline {
+        if !zcode_running() {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    if zcode_running() {
+        for name in ["zcode", "ZCode"] {
+            let _ = no_window("pkill").args(["-9", "-x", name]).output();
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(4);
     while Instant::now() < deadline {
         if !zcode_running() {
             return Ok(true);
@@ -341,6 +353,7 @@ pub fn client_path_candidates(os: &str) -> Vec<String> {
     match os {
         "macos" => vec![
             "/Applications/ZCode.app/Contents/MacOS/ZCode".to_string(),
+            format!("{}/Applications/ZCode.app/Contents/MacOS/ZCode", std::env::var("HOME").unwrap_or_default()),
             "/usr/local/bin/zcode".to_string(),
         ],
         "windows" => vec![
@@ -352,6 +365,7 @@ pub fn client_path_candidates(os: &str) -> Vec<String> {
         _ => vec![
             "/usr/local/bin/zcode".to_string(),
             "/usr/bin/zcode".to_string(),
+            "/opt/ZCode/zcode".to_string(),
             format!("{}/.local/bin/zcode", std::env::var("HOME").unwrap_or_default()),
         ],
     }
