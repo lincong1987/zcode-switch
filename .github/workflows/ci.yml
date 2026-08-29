@@ -23,7 +23,7 @@ jobs:
         working-directory: src-tauri
 
   check-portability:
-    name: cargo check (${{ matrix.os }})
+    name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -46,11 +46,11 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: cargo check
+      - name: cargo test
         shell: bash
         run: |
           cd src-tauri
-          cargo check --lib 2>&1 | tee check.log
+          cargo test --lib 2>&1 | tee check.log
           exit ${PIPESTATUS[0]}
 
       - name: Publish log on failure
@@ -67,3 +67,7 @@ jobs:
           git add "check-${RUNNER_OS}.log"
           git commit -qm "ci log ${GITHUB_SHA}"
           git push -q origin HEAD:ci-logs --force
+
+      - name: cargo check
+        run: cargo check --lib
+        working-directory: src-tauri
