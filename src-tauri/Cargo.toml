@@ -35,6 +35,10 @@ windows-sys = { version = "0.52", features = [
     "Win32_Security",
 ] }
 
+[target.'cfg(not(windows))'.dependencies]
+# X-Client-Timezone 的 IANA 名（Node Intl 同源）
+iana-time-zone = "0.1"
+
 [profile.release]
 strip = "symbols"
 lto = "thin"
