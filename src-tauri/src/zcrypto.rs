@@ -9,14 +9,40 @@ use std::path::Path;
 
 pub const PREFIX: &str = "enc:v1:";
 
-const NODE_PLATFORM: &str = "win32";
+pub fn node_platform_for<'a>(os: &'a str) -> &'a str {
+    match os {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+fn node_os() -> &'static str {
+    node_platform_for(std::env::consts::OS)
+}
+
+fn pick_username(username: Option<&str>, user: Option<&str>, logname: Option<&str>) -> String {
+    username
+        .or(user)
+        .or(logname)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn compose_fallback_secret(platform: &str, home: &str, username: &str) -> String {
+    format!("zcode-credential-fallback:{}:{}:{}", platform, home, username)
+}
 
 pub fn default_secret(home: &Path) -> String {
     if let Ok(s) = std::env::var("ZCODE_CREDENTIAL_SECRET") {
         return s;
     }
-    let username = std::env::var("USERNAME").unwrap_or_else(|_| "unknown".to_string());
-    format!("zcode-credential-fallback:{}:{}:{}", NODE_PLATFORM, home.display(), username)
+    let username = pick_username(
+        std::env::var("USERNAME").ok().as_deref(),
+        std::env::var("USER").ok().as_deref(),
+        std::env::var("LOGNAME").ok().as_deref(),
+    );
+    compose_fallback_secret(node_os(), &home.display().to_string(), &username)
 }
 
 fn derive_key(secret: &str) -> [u8; 32] {
@@ -170,6 +196,38 @@ mod tests {
             assert_eq!(enc.matches('.').count(), 2);
             assert_eq!(decrypt_with_secret(&enc, S).unwrap(), plain);
         }
+    }
+
+    #[test]
+    fn node_platform_mapping_follows_node_semantics() {
+        assert_eq!(node_platform_for("windows"), "win32");
+        assert_eq!(node_platform_for("macos"), "darwin");
+        assert_eq!(node_platform_for("linux"), "linux");
+        assert_eq!(node_os(), node_platform_for(std::env::consts::OS));
+    }
+
+    #[test]
+    fn fallback_secret_format_is_platform_scoped() {
+        assert_eq!(
+            compose_fallback_secret("win32", "C:\\Users\\john", "john"),
+            "zcode-credential-fallback:win32:C:\\Users\\john:john"
+        );
+        assert_eq!(
+            compose_fallback_secret("darwin", "/Users/john", "john"),
+            "zcode-credential-fallback:darwin:/Users/john:john"
+        );
+        assert_eq!(
+            compose_fallback_secret("linux", "/home/john", "john"),
+            "zcode-credential-fallback:linux:/home/john:john"
+        );
+    }
+
+    #[test]
+    fn username_pick_prefers_username_then_user_then_logname() {
+        assert_eq!(pick_username(Some("a"), Some("b"), Some("c")), "a");
+        assert_eq!(pick_username(None, Some("b"), Some("c")), "b");
+        assert_eq!(pick_username(None, None, Some("c")), "c");
+        assert_eq!(pick_username(None, None, None), "unknown");
     }
 
     #[test]

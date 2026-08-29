@@ -23,11 +23,7 @@ pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/bill
 pub const CLIENT_APP_VERSION: &str = "3.10.1";
 
 pub(crate) fn client_platform() -> String {
-    let os = match std::env::consts::OS {
-        "windows" => "win32",
-        "macos" => "darwin",
-        other => other,
-    };
+    let os = crate::zcrypto::node_platform_for(std::env::consts::OS);
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x64",
         "aarch64" => "arm64",
@@ -157,11 +153,11 @@ pub(crate) fn zai_billing_headers_with_mid(token: &str, mid: Option<String>) -> 
         ("HTTP-Referer".into(), ZCODE_ORIGIN.into()),
         ("X-Title".into(), "Z Code@electron".into()),
         ("X-ZCode-App-Version".into(), ver.clone()),
-        ("X-Platform".into(), "win32-x64".into()),
+        ("X-Platform".into(), client_platform()),
         ("X-Release-Channel".into(), ZCODE_CHANNEL.into()),
         ("X-Client-Language".into(), ZCODE_LANG.into()),
         ("X-Client-Timezone".into(), client_timezone()),
-        ("X-Os-Category".into(), "windows".into()),
+        ("X-Os-Category".into(), std::env::consts::OS.into()),
     ];
     if let Some(v) = os_version() {
         h.push(("X-Os-Version".into(), v));
@@ -1643,9 +1639,11 @@ mod tests {
         assert_eq!(h[0].1, format!("ZCode/{}", zcode_app_version()));
         assert_eq!(h[1].1, "https://zcode.z.ai");
         assert_eq!(h[2].1, "Z Code@electron");
-        assert_eq!(h[4].1, "win32-x64");
+        assert_eq!(h[4].1, client_platform());
         assert_eq!(h[5].1, "stable");
         assert_eq!(h[6].1, "zh-CN");
+        let os_cat = h.iter().find(|(k, _)| k == "X-Os-Category").unwrap();
+        assert_eq!(os_cat.1, std::env::consts::OS);
         let auth = h.iter().find(|(k, _)| k == "Authorization").unwrap();
         assert_eq!(auth.1, "Bearer tok-start");
         let rid = h.iter().find(|(k, _)| k == "x-request-id").unwrap();

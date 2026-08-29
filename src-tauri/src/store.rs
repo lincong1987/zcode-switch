@@ -31,7 +31,9 @@ fn detached(mut c: std::process::Command) -> std::process::Command {
 }
 #[cfg(not(windows))]
 fn detached(mut c: std::process::Command) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
+    c.process_group(0);
     c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     c
 }
@@ -40,13 +42,20 @@ pub struct Paths {
     pub home: PathBuf,
 }
 
+fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, home_env: Option<PathBuf>) -> PathBuf {
+    zswitch
+        .or(userprofile)
+        .or(home_env)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 impl Paths {
     pub fn detect() -> Paths {
-        let home = std::env::var("ZCODE_SWITCH_HOME")
-            .map(PathBuf::from)
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("."));
+        let home = pick_home(
+            std::env::var("ZCODE_SWITCH_HOME").ok().map(PathBuf::from),
+            std::env::var("USERPROFILE").ok().map(PathBuf::from),
+            std::env::var("HOME").ok().map(PathBuf::from),
+        );
         Paths { home }
     }
 
@@ -226,6 +235,7 @@ fn in_sandbox() -> bool {
     std::env::var("ZCODE_SWITCH_HOME").is_ok()
 }
 
+#[cfg(windows)]
 pub fn zcode_running() -> bool {
     if in_sandbox() {
         return false;
@@ -241,6 +251,21 @@ pub fn zcode_running() -> bool {
     }
 }
 
+#[cfg(not(windows))]
+pub fn zcode_running() -> bool {
+    if in_sandbox() {
+        return false;
+    }
+    ["zcode", "ZCode"].iter().any(|name| {
+        no_window("pgrep")
+            .args(["-x", name])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(windows)]
 pub fn kill_zcode() -> Result<bool, String> {
     if in_sandbox() {
         return Ok(true);
@@ -251,6 +276,27 @@ pub fn kill_zcode() -> Result<bool, String> {
     let _ = no_window("taskkill")
         .args(["/F", "/IM", "ZCode.exe"])
         .output();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if !zcode_running() {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    Ok(!zcode_running())
+}
+
+#[cfg(not(windows))]
+pub fn kill_zcode() -> Result<bool, String> {
+    if in_sandbox() {
+        return Ok(true);
+    }
+    if !zcode_running() {
+        return Ok(true);
+    }
+    for name in ["zcode", "ZCode"] {
+        let _ = no_window("pkill").args(["-x", name]).output();
+    }
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
         if !zcode_running() {
@@ -291,18 +337,33 @@ pub fn save_settings(paths: &Paths, s: &Settings) -> Result<(), String> {
     atomic_write(&paths.settings_file(), &body)
 }
 
+pub fn client_path_candidates(os: &str) -> Vec<String> {
+    match os {
+        "macos" => vec![
+            "/Applications/ZCode.app/Contents/MacOS/ZCode".to_string(),
+            "/usr/local/bin/zcode".to_string(),
+        ],
+        "windows" => vec![
+            r"C:\Program Files\ZCode\ZCode.exe".to_string(),
+            std::env::var("LOCALAPPDATA")
+                .map(|l| format!(r"{}\Programs\ZCode\ZCode.exe", l))
+                .unwrap_or_default(),
+        ],
+        _ => vec![
+            "/usr/local/bin/zcode".to_string(),
+            "/usr/bin/zcode".to_string(),
+            format!("{}/.local/bin/zcode", std::env::var("HOME").unwrap_or_default()),
+        ],
+    }
+}
+
 pub fn effective_zcode_path(paths: &Paths) -> (String, bool) {
     let s = load_settings(paths);
     if let Some(p) = s.zcode_path {
         let ok = PathBuf::from(&p).exists();
         return (p, ok);
     }
-    let candidates = [
-        r"C:\Program Files\ZCode\ZCode.exe".to_string(),
-        std::env::var("LOCALAPPDATA")
-            .map(|l| format!(r"{}\Programs\ZCode\ZCode.exe", l))
-            .unwrap_or_default(),
-    ];
+    let candidates = client_path_candidates(std::env::consts::OS);
     for c in &candidates {
         if !c.is_empty() && PathBuf::from(c).exists() {
             return (c.clone(), true);
@@ -866,6 +927,37 @@ mod tests {
         }}});
         fs::write(home.join(".zcode/v2/config.json"), serde_json::to_string(&v).unwrap()).unwrap();
         v
+    }
+
+    #[test]
+    fn home_pick_prefers_override_then_platform_home() {
+        assert_eq!(
+            pick_home(Some(PathBuf::from("/x")), Some(PathBuf::from("/up")), Some(PathBuf::from("/h"))),
+            PathBuf::from("/x")
+        );
+        assert_eq!(
+            pick_home(None, Some(PathBuf::from("/up")), Some(PathBuf::from("/h"))),
+            PathBuf::from("/up")
+        );
+        assert_eq!(
+            pick_home(None, None, Some(PathBuf::from("/h"))),
+            PathBuf::from("/h")
+        );
+        assert_eq!(pick_home(None, None, None), PathBuf::from("."));
+    }
+
+    #[test]
+    fn zcode_path_candidates_cover_three_oses() {
+        let win = client_path_candidates("windows");
+        assert!(win[0].contains("ZCode.exe"), "windows 首选应为 Program Files 下的 exe");
+        let mac = client_path_candidates("macos");
+        assert!(mac.iter().any(|p| p.contains("ZCode.app/Contents/MacOS")), "mac 应含 .app 包内可执行");
+        let linux = client_path_candidates("linux");
+        assert!(linux.iter().any(|p| p == "/usr/local/bin/zcode" || p == "/usr/bin/zcode"), "linux 应含系统路径");
+        assert!(
+            client_path_candidates("windows").iter().all(|p| !p.contains(".app")),
+            "windows 候选不得混入 mac 路径"
+        );
     }
 
     #[test]
