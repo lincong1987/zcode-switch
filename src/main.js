@@ -439,14 +439,25 @@ function slotRowsHtml(items) {
   ].join("");
 }
 
+function expireInfo(s) {
+  if (!s) return null;
+  const hasTime = s.length >= 16;
+  const ms = new Date(hasTime ? s.replace(" ", "T") : s + "T23:59:59") - Date.now();
+  if (isNaN(ms)) return { text: s, soon: false, warn: false };
+  const soon = ms <= 5 * 86400000;
+  const warn = ms <= 7 * 86400000;
+  return { text: soon && hasTime ? s : s.slice(0, 10), soon, warn };
+}
+
 function planGroupHtml(p) {
   const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
+  const exp = expireInfo(p.expire);
   return `
   <div class="plan-grp">
     <div class="pg-head">
       ${p.tier ? tierChipHtml(p.tier, p.tier_code) : ""}
       <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
-      ${p.expire ? `<span class="pg-exp" title="${esc(t("q.validUntil", { date: p.expire }))}">${esc(t("q.validUntilShort", { date: p.expire }))}</span>` : ""}
+      ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
     </div>
     ${slotRowsHtml(p.items)}
   </div>`;
@@ -479,7 +490,32 @@ function acctQuotaSlot(id) {
   return `<div class="row-quota-slot">${strip}${inner}</div>`;
 }
 
+function captureScroll() {
+  const list = $app.querySelector(".list");
+  if (!list || list.scrollTop === 0) return null;
+  const listTop = list.getBoundingClientRect().top;
+  for (const row of list.querySelectorAll(".row[data-id]")) {
+    if (row.getBoundingClientRect().bottom > listTop) {
+      return { id: row.dataset.id, offset: row.getBoundingClientRect().top - listTop, scrollTop: list.scrollTop };
+    }
+  }
+  return null;
+}
+function restoreScroll(cap) {
+  if (!cap) return;
+  const list = $app.querySelector(".list");
+  if (!list) return;
+  const row = list.querySelector(`.row[data-id="${CSS.escape(cap.id)}"]`);
+  if (row) {
+    const delta = row.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    list.scrollTop = delta - cap.offset;
+  } else {
+    list.scrollTop = cap.scrollTop;
+  }
+}
+
 function render() {
+  const scrollCap = captureScroll();
   if (!state) {
     $app.innerHTML = `<div class="loading">LOADING</div>`;
     return;
@@ -515,10 +551,9 @@ function render() {
     const q = acctQuota[a.id];
     let meta = "";
     if (!a.has_config) meta += `<span class="no-cfg">${t("q.noCfg")}</span>`;
-    if (q?.data?.plan_expire) {
-        const days = Math.ceil((new Date(q.data.plan_expire + "T23:59:59") - Date.now()) / 86400000);
-        const cls = days <= 7 ? " warn-line" : "";
-        meta += `<span class="${cls.trim()}">${esc(t("q.validUntil", { date: q.data.plan_expire }))}</span>`;
+    const exp = expireInfo(q?.data?.plan_expire);
+    if (exp) {
+        meta += `<span class="${exp.warn ? "warn-line" : ""}">${esc(t("q.validUntil", { date: exp.text }))}</span>`;
     }
     if (ident) meta += `${meta ? " · " : ""}${esc(ident)}`;
     return `
@@ -586,6 +621,7 @@ function render() {
 
     <main class="list">${listHtml}</main>
   `;
+  restoreScroll(scrollCap);
 }
 
 window.actions = actions;

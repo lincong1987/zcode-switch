@@ -172,7 +172,7 @@ pub fn identity_with_secret(creds: &Value, secret: &str) -> Identity {
             .and_then(|v| v.as_str())
             .or_else(|| ui.get("rawProfile").and_then(|r| r.get("email")).and_then(|v| v.as_str()))
             .map(String::from);
-        if let Some(uid) = ui.get("id") {
+        if let Some(uid) = ui.get("id").filter(|v| !v.is_null()) {
             id.user_id = uid.as_str().map(String::from).or_else(|| serde_json::to_string(uid).ok());
         }
     }

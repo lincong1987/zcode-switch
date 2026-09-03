@@ -194,18 +194,22 @@ pub fn extract_user_profile(provider: &str, raw: &Value) -> Option<Value> {
     if !["user_id", "email", "name", "avatar"].iter().any(|k| nonempty(k)) {
         return None;
     }
-    let id = u.get("user_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let id = u
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let name = u
         .get("name")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .or_else(|| u.get("email").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
-        .unwrap_or(id);
+        .or(id);
     Some(json!({
         "id": id,
-        "username": name,
-        "displayName": name,
+        "username": name.unwrap_or(""),
+        "displayName": name.unwrap_or(""),
         "email": u.get("email").and_then(|v| v.as_str()).unwrap_or(""),
         "avatarUrl": u.get("avatar").and_then(|v| v.as_str()).unwrap_or(""),
     }))
@@ -805,6 +809,10 @@ mod tests {
         assert!(extract_user_profile("zai", &raw).is_none());
         assert!(extract_user_profile("zai", &json!({ "data": {} })).is_none());
         assert!(extract_user_profile("bigmodel", &raw).is_none());
+        let raw = json!({ "data": { "user": { "name": "Ethan", "email": "e@x.com", "avatar": "http://a/x.png" } } });
+        let p = extract_user_profile("zai", &raw).unwrap();
+        assert!(p["id"].is_null(), "缺 user_id 时 id 必须为 null，不得为 unknown: {}", p["id"]);
+        assert_eq!(p["username"], "Ethan");
     }
 
     #[test]

@@ -472,7 +472,19 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
 
             let accounts = list_accounts(&paths)?;
             let hash = canonical_hash(&credentials);
-            if let Some(dup) = accounts.iter().find(|a| a.hash == hash) {
+            if let Some(i) = store::find_same_login(&credentials, &hash, &accounts, &paths.home) {
+                let mut dup = accounts[i].clone();
+                dup.hash = hash.clone();
+                dup.credentials = credentials;
+                dup.config = Some(config);
+                dup.updated_at = now_ts();
+                if dup.virtual_device_mid.as_deref().map_or(true, |m| m.trim().is_empty()) {
+                    dup.virtual_device_mid = Some(mid);
+                }
+                if !flow_still_ours() {
+                    return Err("__superseded__".into());
+                }
+                save_account(&paths, &dup)?;
                 *pending_oauth_guard() = None;
                 return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
             }
@@ -496,6 +508,7 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
                 credentials,
                 config: Some(config),
                 virtual_device_mid: Some(mid),
+                virtual_arms_uid: Some(store::new_arms_uid()),
             };
             if !flow_still_ours() {
                 return Err("__superseded__".into());

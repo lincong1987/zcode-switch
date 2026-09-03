@@ -764,18 +764,33 @@ fn looks_like_date(d: &str) -> bool {
     d.len() == 10 && d.as_bytes().get(4) == Some(&b'-') && d.as_bytes().get(7) == Some(&b'-')
 }
 
+fn looks_like_dt(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 16 {
+        return false;
+    }
+    let p = &b[..16];
+    p[4] == b'-' && p[7] == b'-' && p[10] == b' ' && p[13] == b':'
+        && (0..16).all(|i| match i {
+            0..=3 | 5..=6 | 8..=9 | 11..=12 | 14..=15 => p[i].is_ascii_digit(),
+            _ => true,
+        })
+}
+
 fn extract_expire(obj: &Value) -> Option<String> {
-    const KEYS: [&str; 8] = ["nextRenewTime", "expireTime", "expire_time", "endTime", "end_time", "expireAt", "expiredTime", "validEndTime"];
+    const KEYS: [&str; 12] = [
+        "nextRenewTime", "expireTime", "expire_time", "endTime", "end_time", "expireAt", "expiredTime", "validEndTime",
+        "expires_at", "expiresAt", "expired_at", "period_end",
+    ];
     for k in KEYS {
         let Some(v) = obj.get(k) else { continue };
         if let Some(n) = v.as_i64() {
+            use chrono::TimeZone;
             if n > 1_000_000_000_000 {
-                use chrono::TimeZone;
-                return chrono::Local.timestamp_millis_opt(n).single().map(|t| t.format("%Y-%m-%d").to_string());
+                return chrono::Local.timestamp_millis_opt(n).single().map(|t| t.format("%Y-%m-%d %H:%M").to_string());
             }
             if n > 1_000_000_000 {
-                use chrono::TimeZone;
-                return chrono::Local.timestamp_opt(n, 0).single().map(|t| t.format("%Y-%m-%d").to_string());
+                return chrono::Local.timestamp_opt(n, 0).single().map(|t| t.format("%Y-%m-%d %H:%M").to_string());
             }
         }
         if let Some(s) = v.as_str() {
@@ -784,15 +799,30 @@ fn extract_expire(obj: &Value) -> Option<String> {
                 continue;
             }
             if let Ok(n) = t.parse::<i64>() {
+                use chrono::TimeZone;
                 if n > 1_000_000_000_000 {
-                    use chrono::TimeZone;
                     if let Some(dt) = chrono::Local.timestamp_millis_opt(n).single() {
-                        return Some(dt.format("%Y-%m-%d").to_string());
+                        return Some(dt.format("%Y-%m-%d %H:%M").to_string());
+                    }
+                } else if n > 1_000_000_000 {
+                    if let Some(dt) = chrono::Local.timestamp_opt(n, 0).single() {
+                        return Some(dt.format("%Y-%m-%d %H:%M").to_string());
                     }
                 }
             }
-            let d = safe_prefix(t, 10);
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
+                return Some(dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string());
+            }
+            let t = if t.as_bytes().get(10) == Some(&b'T') {
+                format!("{} {}", &t[..10], &t[11..])
+            } else {
+                t.to_string()
+            };
+            let d = safe_prefix(&t, 10);
             if looks_like_date(d) {
+                if looks_like_dt(&t) {
+                    return Some(safe_prefix(&t, 16).to_string());
+                }
                 return Some(d.to_string());
             }
             return Some(t.to_string());
@@ -800,6 +830,9 @@ fn extract_expire(obj: &Value) -> Option<String> {
     }
     if let Some(s) = obj.get("valid").and_then(|v| v.as_str()) {
         let tail = safe_suffix(s, 19);
+        if looks_like_dt(tail) {
+            return Some(safe_prefix(tail, 16).to_string());
+        }
         if looks_like_date(safe_prefix(tail, 10)) {
             return Some(safe_prefix(tail, 10).to_string());
         }
@@ -809,6 +842,21 @@ fn extract_expire(obj: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn expiry_field(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        Value::Number(_) => {
+            let mut o = serde_json::Map::new();
+            o.insert("expires_at".to_string(), v.clone());
+            extract_expire(&Value::Object(o))
+        }
+        _ => None,
+    }
 }
 
 fn tier_from_level(level: &str) -> String {
@@ -1171,7 +1219,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 },
                 server_percentage: None,
                 unit: item.get("unit_type").or_else(|| item.get("meter")).and_then(Value::as_str).unwrap_or("quota").to_string(),
-                period_end: ["period_end", "expires_at"].iter().find_map(|k| item.get(k).and_then(Value::as_str)).map(String::from),
+                period_end: ["period_end", "expires_at"].iter().find_map(|k| item.get(k).and_then(expiry_field)),
                 ..Default::default()
             };
             let bpid = ["plan_id", "planId", "entitlement_id"]
@@ -1186,7 +1234,12 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 None
             };
             match target {
-                Some(s) => s.items.push(it),
+                Some(s) => {
+                    if s.expire.is_none() {
+                        s.expire = extract_expire(item);
+                    }
+                    s.items.push(it);
+                }
                 None => loose.push(it),
             }
         }
@@ -1291,7 +1344,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                     .max()
                     .and_then(|n| {
                         use chrono::TimeZone;
-                        chrono::Local.timestamp_opt(n, 0).single().map(|t| t.format("%Y-%m-%d").to_string())
+                        chrono::Local.timestamp_opt(n, 0).single().map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     })
             })
         })
@@ -1730,9 +1783,53 @@ mod tests {
         let sub = json!({ "nextRenewTime": "2027-07-28", "valid": "2027-07-28 10:00:00-2028-07-28 10:00:00" });
         assert_eq!(extract_expire(&sub).as_deref(), Some("2027-07-28"));
         let sub2 = json!({ "valid": "2027-07-28 10:00:00-2028-07-28 10:00:00" });
-        assert_eq!(extract_expire(&sub2).as_deref(), Some("2028-07-28"));
+        assert_eq!(extract_expire(&sub2).as_deref(), Some("2028-07-28 10:00"));
         let sub3 = json!({ "expireTime": null, "endTime": "2026-12-31 00:00:00" });
-        assert_eq!(extract_expire(&sub3).as_deref(), Some("2026-12-31"));
+        assert_eq!(extract_expire(&sub3).as_deref(), Some("2026-12-31 00:00"));
+        let sub4 = json!({ "expireTime": "2026-09-02 14:30:00" });
+        assert_eq!(extract_expire(&sub4).as_deref(), Some("2026-09-02 14:30"));
+        let sub5 = json!({ "expireTime": "2026-09-02" });
+        assert_eq!(extract_expire(&sub5).as_deref(), Some("2026-09-02"));
+        let sub6 = json!({ "expireTime": 1810000000000i64 });
+        let e6 = extract_expire(&sub6).unwrap();
+        assert_eq!(e6.len(), 16, "epoch 应格式化为 YYYY-MM-DD HH:MM：{e6}");
+        let sub7 = json!({ "expires_at": 1787533200i64 });
+        let e7 = extract_expire(&sub7).unwrap();
+        assert_eq!(e7.len(), 16, "epoch 秒应格式化为 YYYY-MM-DD HH:MM：{e7}");
+        assert!(e7.starts_with("2026-08-24"), "epoch 秒本地日期前缀：{e7}");
+        let sub8 = json!({ "expires_at": "1787533200" });
+        assert_eq!(extract_expire(&sub8).as_deref(), Some(e7.as_str()), "字符串 epoch 秒与 int 同解");
+        let sub9 = json!({ "endTime": "2026-09-02T14:30:00Z" });
+        let expected9 = chrono::DateTime::parse_from_rfc3339("2026-09-02T14:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        assert_eq!(extract_expire(&sub9).as_deref(), Some(expected9.as_str()));
+        let sub9b = json!({ "endTime": "2026-09-02T14:30" });
+        assert_eq!(extract_expire(&sub9b).as_deref(), Some("2026-09-02 14:30"));
+    }
+
+    #[test]
+    fn slot_expire_falls_back_to_own_bucket_expiry() {
+        let b = json!({ "data": {
+            "balances": [
+                { "show_name": "GLM-5.3", "plan_id": "p1", "total_units": 100, "used_units": 10, "remaining_units": 90, "expires_at": 1787533200i64 },
+            ],
+            "plans": [ { "plan_id": "p1", "name": "ZCode Global Build", "status": "active" } ]}});
+        let ov = normalize_balance(&b);
+        assert_eq!(ov.plans.len(), 1);
+        let pe = ov.plans[0].expire.as_deref().unwrap_or_default();
+        assert_eq!(pe.len(), 16, "切片到期应从 bucket expires_at 兜底且带时分：{pe}");
+        assert!(pe.starts_with("2026-08-24"), "bucket epoch 秒本地日期前缀：{pe}");
+        let b2 = json!({ "data": {
+            "balances": [
+                { "show_name": "GLM-5.3", "plan_id": "p1", "total_units": 100, "used_units": 10, "expires_at": 1787533200i64 },
+            ],
+            "plans": [ { "plan_id": "p1", "name": "ZCode Global Build", "status": "active", "expireTime": 1810000000000i64 } ]}});
+        let ov2 = normalize_balance(&b2);
+        let pe2 = ov2.plans[0].expire.as_deref().unwrap_or_default();
+        assert!(pe2.starts_with("2027-"), "plans[] 自带到期优先，不被 bucket 覆盖：{pe2}");
     }
 
     #[test]
@@ -1752,6 +1849,8 @@ mod tests {
             { "show_name": "GLM-5.3", "total_units": 50, "used_units": 0, "expires_at": 1787533200 }
         ] } });
         let ov = normalize_balance(&bal);
-        assert_eq!(ov.plan_expire.as_deref(), Some("2026-08-24"));
+        let pe = ov.plan_expire.as_deref().unwrap_or_default();
+        assert_eq!(pe.len(), 16, "最晚 bucket 到期应带时分：{pe}");
+        assert!(pe.starts_with("2026-08-24"), "最晚 bucket 到期，本地时区日期前缀：{pe}");
     }
 }
