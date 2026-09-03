@@ -355,9 +355,17 @@ pub fn open_url(url: &str) -> Result<(), String> {
         c
     };
     #[cfg(target_os = "macos")]
-    let cmd = no_window("open").arg(url);
+    let cmd = {
+        let mut c = no_window("open");
+        c.arg(url);
+        c
+    };
     #[cfg(all(not(windows), not(target_os = "macos")))]
-    let cmd = no_window("xdg-open").arg(url);
+    let cmd = {
+        let mut c = no_window("xdg-open");
+        c.arg(url);
+        c
+    };
     let _ = detached(cmd).spawn();
     Ok(())
 }
@@ -1826,7 +1834,7 @@ mod tests {
         assert!(a.config.is_none());
         write_live_raw(&home, "B1");
         write_config_raw(&home, "CB");
-        let b = capture_current(&p, Some("B".into())).unwrap();
+        let _b = capture_current(&p, Some("B".into())).unwrap();
 
         switch_to(&p, &a.id, true, false, false).unwrap();
         let cfg = fs::read_to_string(p.live_config()).unwrap();
