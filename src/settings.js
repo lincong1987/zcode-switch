@@ -30,6 +30,10 @@ async function guard(fn) {
 const actions = {
   async refresh() { await refresh(); render(); },
 
+  async openGitHub() {
+    await invoke("open_external", { url: "https://github.com/pjpv/zcode-switch" });
+  },
+
   async setLang(l) {
     if (l === lang()) return;
     await guard(async () => {

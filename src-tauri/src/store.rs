@@ -341,6 +341,27 @@ pub fn launch_zcode(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn open_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("仅支持 https 链接".into());
+    }
+    if in_sandbox() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    let cmd = {
+        let mut c = no_window("cmd");
+        c.args(["/c", "start", "", url]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let cmd = no_window("open").arg(url);
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let cmd = no_window("xdg-open").arg(url);
+    let _ = detached(cmd).spawn();
+    Ok(())
+}
+
 pub fn load_settings(paths: &Paths) -> Settings {
     match fs::read_to_string(paths.settings_file()) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {

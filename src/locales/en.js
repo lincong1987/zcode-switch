@@ -144,6 +144,7 @@ export const en = {
   "s.exportAllBtn": "Export all (encrypted)",
   "s.pathLabel": "ZCODE PATH · ZCode executable",
   "s.browse": "Browse",
+  "s.githubLink": "GitHub repository · feedback & updates",
   "s.hint": "Switching replaces both credentials.json and config.json; any unsaved current login is auto-preserved before switching — accounts are never lost.",
   "s.autostartOnToast": "Autostart enabled",
   "s.autostartOffToast": "Autostart disabled",

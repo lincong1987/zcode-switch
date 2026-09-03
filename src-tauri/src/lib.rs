@@ -851,6 +851,11 @@ async fn launch_zcode(app: AppHandle) -> Result<(), String> {
     r
 }
 
+#[tauri::command]
+async fn open_external(url: String) -> Result<(), String> {
+    store::open_url(&url)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -893,6 +898,7 @@ pub fn run() {
             pick_zcode_path,
             set_zcode_path,
             launch_zcode,
+            open_external,
             open_settings,
             reveal_main,
         ])
