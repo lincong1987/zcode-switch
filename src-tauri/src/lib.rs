@@ -197,6 +197,30 @@ async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Re
 }
 
 #[tauri::command]
+async fn model_config_list() -> Result<Vec<store::ModelConfigSummary>, String> {
+    store::model_config_summaries(&Paths::detect())
+}
+
+#[tauri::command]
+async fn extract_model_config(app: AppHandle) -> Result<store::ModelConfigSummary, String> {
+    let _guard = store_guard();
+    let r = store::extract_model_config(&Paths::detect());
+    rebuild_tray(&app);
+    r
+}
+
+#[tauri::command]
+async fn inject_model_config(app: AppHandle, file: String) -> Result<store::ModelConfigSummary, String> {
+    let _guard = store_guard();
+    let r = store::inject_model_config(&Paths::detect(), &file);
+    rebuild_tray(&app);
+    if r.is_ok() {
+        let _ = app.emit("state-changed", ());
+    }
+    r
+}
+
+#[tauri::command]
 async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
     store::live_quota(&Paths::detect())
 }
@@ -365,7 +389,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
         tauri::WebviewUrl::External(url.parse::<tauri::Url>().map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?),
     )
     .title(i18n::tr("title.login"))
-    .theme(Some(tauri::Theme::Dark))
+    .theme(Some(tauri::Theme::Light))
     .inner_size(480.0, 680.0)
     .min_inner_size(420.0, 560.0)
     .resizable(true)
@@ -538,8 +562,8 @@ fn open_captcha_window(app: &AppHandle) -> Result<(), String> {
         tauri::WebviewUrl::App("captcha.html".into()),
     )
     .title(i18n::tr("title.captcha"))
-    .theme(Some(tauri::Theme::Dark))
-    .background_color(tauri::window::Color(10, 10, 12, 255))
+    .theme(Some(tauri::Theme::Light))
+    .background_color(tauri::window::Color(245, 247, 249, 255))
     .inner_size(w, h)
     .min_inner_size(340.0, 280.0)
     .maximizable(false)
@@ -568,6 +592,7 @@ async fn set_behavior(
     launch_after_switch: Option<bool>,
     close_to_tray: Option<bool>,
     hot_switch: Option<bool>,
+    auto_claim: Option<bool>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -580,6 +605,9 @@ async fn set_behavior(
     }
     if let Some(v) = hot_switch {
         s.hot_switch = Some(v);
+    }
+    if let Some(v) = auto_claim {
+        s.auto_claim = Some(v);
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);
@@ -633,8 +661,8 @@ async fn open_settings(app: AppHandle) -> Result<(), String> {
         tauri::WebviewUrl::App("settings.html".into()),
     )
     .title(i18n::tr("title.settings"))
-    .theme(Some(tauri::Theme::Dark))
-    .background_color(tauri::window::Color(10, 10, 12, 255))
+    .theme(Some(tauri::Theme::Light))
+    .background_color(tauri::window::Color(245, 247, 249, 255))
     .inner_size(w, h)
     .min_inner_size(440.0, 540.0)
     .resizable(true)
@@ -856,6 +884,9 @@ pub fn run() {
             delete_account,
             update_account_from_live,
             switch_to,
+            model_config_list,
+            extract_model_config,
+            inject_model_config,
             get_live_quota,
             get_account_quota,
             claim_preview,

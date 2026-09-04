@@ -70,6 +70,11 @@ export function installDelegation() {
     if (!el) return;
     runAttr(el.getAttribute("keydown") || "", e);
   });
+  document.addEventListener("change", (e) => {
+    const el = e.target.closest("[change]");
+    if (!el) return;
+    runAttr(el.getAttribute("change") || "", e);
+  });
   document.addEventListener("blur", (e) => {
     const el = e.target.closest("[blur]");
     if (!el) return;

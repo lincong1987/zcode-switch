@@ -11,6 +11,9 @@ let busy = false;
 let acctQuota = {};
 let claimable = {};
 let claimAllRunning = false;
+let modelConfigs = [];
+let selectedModelFile = "";
+let modelConfigsBusy = false;
 
 const NOTCH_COLORS = ["var(--notch-1)", "var(--notch-2)", "var(--notch-3)", "var(--notch-4)", "var(--notch-5)", "var(--notch-6)"];
 function notchColor(id) {
@@ -37,9 +40,63 @@ function idLabel(id) {
   return id.display_name || id.username || id.email || null;
 }
 
+function maxUsedPct(id) {
+  const data = acctQuota[id]?.data;
+  if (!data) return null;
+  const pools = [];
+  for (const p of data.plans || []) {
+    for (const it of p.items || []) if (it.percent_used != null) pools.push(it.percent_used);
+  }
+  for (const it of data.items || []) if (it.percent_used != null) pools.push(it.percent_used);
+  return pools.length ? Math.max(...pools) : null;
+}
+
+function statChip(icon, tone, label, value, sub) {
+  return `
+  <div class="stat-chip">
+    <span class="stat-ic ${tone}">${ic(icon, 17)}</span>
+    <span class="stat-main">
+      <span class="stat-label">${esc(label)}</span>
+      <span class="stat-value">${esc(String(value))}</span>
+      <span class="stat-sub">${esc(sub)}</span>
+    </span>
+  </div>`;
+}
+
+function statRowHtml(s) {
+  const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
+  const withQuota = s.accounts.filter((a) => maxUsedPct(a.id) != null).length;
+  const criticalCount = s.accounts.filter((a) => (maxUsedPct(a.id) ?? 0) >= 90).length;
+  return `<div class="stat-row">
+    ${statChip("userPlus", "teal", t("stat.accounts"), s.accounts.length, t("stat.accountsSub"))}
+    ${statChip("power", s.zcode_running ? "green" : "", t("stat.runtime"),
+      s.zcode_running ? t("stat.runtimeOn") : t("stat.runtimeOff"), t("stat.runtimeSub"))}
+    ${statChip("gift", claimableCount > 0 ? "amber" : "", t("stat.claimable"), claimableCount, t("stat.claimableSub"))}
+    ${statChip("alert", criticalCount > 0 ? "red" : "", t("stat.critical"),
+      withQuota ? criticalCount : "—", t("stat.criticalSub"))}
+  </div>`;
+}
+
 async function refresh() {
   state = await invoke("get_state");
   if (state?.language) init(state.language);
+}
+
+async function refreshModelConfigs() {
+  modelConfigsBusy = true;
+  try {
+    modelConfigs = await invoke("model_config_list");
+    if (!modelConfigs.some((x) => x.file === selectedModelFile)) {
+      selectedModelFile = modelConfigs[0]?.file || "";
+    }
+  } finally {
+    modelConfigsBusy = false;
+  }
+}
+
+function modelConfigLabel(item) {
+  const owner = item.account_name || item.account_id || t("models.unknownAccount");
+  return `${owner} · ${item.timestamp || item.file}`;
 }
 
 function uiLocked() {
@@ -94,8 +151,71 @@ function waitForClaimResult(accountId, timeoutMs = 90000) {
   });
 }
 
+const AUTO_CLAIM_COOLDOWN_MS = 30 * 60 * 1000;
+let autoClaimBusy = false;
+let autoClaimFor = null;
+const autoClaimCooldown = {};
+
+async function autoClaim(id) {
+  const plan = claimable[id]?.plans?.[0];
+  if (!plan) return;
+  const name = state?.accounts.find((a) => a.id === id)?.name || id;
+  autoClaimBusy = true;
+  autoClaimFor = id;
+  try {
+    await invoke("claim_start", { id, planId: plan.plan_id });
+    toast(t("m.autoClaimStart", { plan: plan.name || plan.plan_id }));
+    const r = await waitForClaimResult(id, 120000);
+    if (!r) {
+      autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_COOLDOWN_MS;
+      toast(t("m.autoClaimTimeout", { name }), "warn");
+      await invoke("claim_cancel").catch(() => {});
+    } else if (r.ok === false) {
+      autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_COOLDOWN_MS;
+    } else {
+      delete autoClaimCooldown[id];
+    }
+  } catch (e) {
+    autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_COOLDOWN_MS;
+    toast(t("m.autoClaimFailed", { name, msg: stripErr(e) }), "err");
+  } finally {
+    autoClaimBusy = false;
+    autoClaimFor = null;
+  }
+}
+
 const actions = {
-  async refresh() { await refresh(); render(); },
+  async refresh() { await refresh(); await refreshModelConfigs(); render(); },
+
+  onModelConfigChange(event) {
+    selectedModelFile = event.target.value;
+  },
+
+  async extractModelConfig() {
+    await guard(async () => {
+      const r = await invoke("extract_model_config");
+      selectedModelFile = r.file;
+      await refreshModelConfigs();
+      toast(t("models.extracted"), "ok", modelConfigLabel(r));
+      render();
+    });
+  },
+
+  async injectModelConfig() {
+    if (!selectedModelFile) {
+      toast(t("models.selectFirst"), "err");
+      return;
+    }
+    await guard(async () => {
+      const r = await invoke("inject_model_config", { file: selectedModelFile });
+      delete acctQuota[state?.active_account_id];
+      await refresh();
+      await refreshModelConfigs();
+      pokeAccount(state?.active_account_id);
+      toast(t("models.injected"), "ok", modelConfigLabel(r));
+      render();
+    });
+  },
 
   async capture() {
     await guard(async () => {
@@ -265,6 +385,7 @@ const actions = {
 
   async claim(id) {
     if (claimAllRunning) { toast(t("m.claimBusy"), "warn"); return; }
+    if (autoClaimBusy) { toast(t("m.autoClaimBusy"), "warn"); return; }
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
     if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
@@ -284,6 +405,7 @@ const actions = {
       .filter((id) => (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
     if (claimAllRunning) return;
+    if (autoClaimBusy) { toast(t("m.autoClaimBusy"), "warn"); return; }
     claimAllRunning = true;
     try {
       for (let i = 0; i < ids.length; i++) {
@@ -480,6 +602,7 @@ function acctQuotaSlot(id) {
 }
 
 function render() {
+  const listScrollTop = $app.querySelector(".list")?.scrollTop ?? 0;
   if (!state) {
     $app.innerHTML = `<div class="loading">LOADING</div>`;
     return;
@@ -561,7 +684,7 @@ function render() {
         <span class="status-text">${esc(statusText)}</span>
       </div>
     </header>
-
+    ${statRowHtml(s)}
     <section class="toolbar">
       <button class="btn-primary has-ic${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
         title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : ""}">
@@ -572,6 +695,14 @@ function render() {
             title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
         : ""}
       <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
+      <label class="model-config-picker">
+        <span>${t("models.label")}</span>
+        <select change="actions.onModelConfigChange(event)" aria-label="${t("models.label")}" ${modelConfigsBusy ? "disabled" : ""}>
+          ${modelConfigs.length ? modelConfigs.map((item) => `<option value="${esc(item.file)}" ${item.file === selectedModelFile ? "selected" : ""}>${esc(modelConfigLabel(item))}</option>`).join("") : `<option value="">${t("models.empty")}</option>`}
+        </select>
+      </label>
+      <button class="btn-ghost has-ic" click="actions.extractModelConfig()" ${!s.active_account_id ? "disabled" : ""} title="${t("models.extractTitle")}">${ic("export", 16)} ${t("models.extract")}</button>
+      <button class="btn-ghost has-ic" click="actions.injectModelConfig()" ${!selectedModelFile || !s.active_account_id ? "disabled" : ""} title="${t("models.injectTitle")}">${ic("import", 16)} ${t("models.inject")}</button>
       ${s.zcode_running
         ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
         : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
@@ -586,6 +717,8 @@ function render() {
 
     <main class="list">${listHtml}</main>
   `;
+  const list = $app.querySelector(".list");
+  if (list) list.scrollTop = Math.min(listScrollTop, list.scrollHeight - list.clientHeight);
 }
 
 window.actions = actions;
@@ -604,14 +737,15 @@ listen("tray-action", (ev) => {
 
 listen("claim://result", (ev) => {
   const p = ev.payload || {};
+  const isAuto = autoClaimFor != null && autoClaimFor === p.accountId;
   if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
   if (p.ok === false) {
-    toast(t("m.claimFailed", { name: p.accountName, msg: p.message || t("m.unknownErr") }), "err");
+    toast(t(isAuto ? "m.autoClaimFailed" : "m.claimFailed", { name: p.accountName, msg: p.message || t("m.unknownErr") }), "err");
   } else {
     const bits = [];
     if (p.startsAt) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
     if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
-    toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
+    toast(t(isAuto ? "m.autoClaimOk" : "m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
   }
   if (p.accountId) {
     loadAcctQuota(p.accountId);
@@ -635,7 +769,10 @@ listen("oauth://done", (ev) => {
 });
 
 listen("state-changed", () => {
-  refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
+  refresh().then(async () => {
+    await refreshModelConfigs();
+    if (!uiLocked()) render();
+  }).catch(() => {});
 });
 
 const SWEEP_PERIOD = 5 * 60 * 1000;
@@ -670,6 +807,15 @@ async function sweepTick() {
     await loadClaimPreview(due.id);
     if (quotaDue[due.id] === dueAt) scheduleNext(due.id);
     if (!uiLocked()) render();
+    if (
+      state?.auto_claim
+      && !claimAllRunning
+      && !autoClaimBusy
+      && (claimable[due.id]?.plans?.length || 0) > 0
+      && Date.now() >= (autoClaimCooldown[due.id] || 0)
+    ) {
+      autoClaim(due.id);
+    }
   } finally {
     ticking = false;
   }
@@ -678,13 +824,20 @@ async function sweepTick() {
 (async () => {
   try {
     await refresh();
+    await refreshModelConfigs();
     render();
     await invoke("reveal_main");
     setTimeout(dismissSplash, 350);
     enrollAccounts();
     sweepTick();
     setInterval(() => {
-      invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
+      invoke("get_state").then(async (s) => {
+        state = s;
+        if (s?.language) init(s.language);
+        await refreshModelConfigs();
+        enrollAccounts();
+        if (!uiLocked()) render();
+      }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
   } catch (e) {

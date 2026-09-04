@@ -11,7 +11,7 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **Save / switch accounts**: snapshots the credentials + config file pair, atomic replacement; the current login is auto-preserved before any switch — accounts are never lost
 - **Add accounts**: OAuth login for new accounts inside the tool (BigModel / z.ai entries), never touching the current login
 - **Quota display**: inline plan quota and reset time per account row, multi-plan grouping, staggered polling
-- **Claim promotions**: one-click claim for eligible promotions (GUI captcha)
+- **Claim promotions**: one-click claim for eligible promotions (GUI captcha); optional **auto-claim** (off by default) in Settings — claimable plans found while polling are verified and claimed automatically, with a message on success or failure; retries pause for 30 minutes after a failed verification
 - **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption
 - **Bilingual UI (中文 / English)**: one-click switch in Settings — main window, tray, error messages and CLI output all covered; first run follows your OS language
 - **Tray / autostart / CLI automation**

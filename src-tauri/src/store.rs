@@ -100,6 +100,8 @@ pub struct Settings {
     #[serde(default)]
     pub hot_switch: Option<bool>,
     #[serde(default)]
+    pub auto_claim: Option<bool>,
+    #[serde(default)]
     pub auth_proxy_on: Option<bool>,
     #[serde(default)]
     pub auth_proxy_url: Option<String>,
@@ -111,6 +113,7 @@ impl Settings {
     pub fn launch_after_switch(&self) -> bool { self.launch_after_switch.unwrap_or(true) }
     pub fn close_to_tray(&self) -> bool { self.close_to_tray.unwrap_or(true) }
     pub fn hot_switch(&self) -> bool { self.hot_switch.unwrap_or(false) }
+    pub fn auto_claim(&self) -> bool { self.auto_claim.unwrap_or(false) }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -146,9 +149,25 @@ pub struct AppState {
     pub launch_after_switch: bool,
     pub close_to_tray: bool,
     pub hot_switch: bool,
+    pub auto_claim: bool,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ModelConfigSnapshot {
+    pub format: String,
+    pub providers: Value,
+    pub selections: Value,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ModelConfigSummary {
+    pub file: String,
+    pub account_id: String,
+    pub account_name: Option<String>,
+    pub timestamp: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -196,6 +215,15 @@ pub fn is_logged_in(v: &Value) -> bool {
 pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
     fs::write(&tmp, data).map_err(|e| trf("err.write_file", &[("path", &path.display().to_string()), ("e", &e.to_string())]))?;
+    #[cfg(windows)]
+    if path.exists() {
+        // Windows rename cannot replace an existing file. The temporary file still
+        // prevents readers from seeing a partial write; remove the old target first.
+        if let Err(e) = fs::remove_file(path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(trf("err.rename_fail", &[("path", &path.display().to_string()), ("e", &e.to_string())]));
+        }
+    }
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(trf("err.rename_fail", &[("path", &path.display().to_string()), ("e", &e.to_string())]));
@@ -232,7 +260,122 @@ pub fn write_live(paths: &Paths, v: &Value) -> Result<(), String> {
 
 pub fn write_live_config(paths: &Paths, v: &Value) -> Result<(), String> {
     let body = serde_json::to_string_pretty(v).unwrap_or_default() + "\n";
+    if let Some(parent) = paths.live_config().parent() {
+        fs::create_dir_all(parent).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
+    }
     atomic_write(&paths.live_config(), &body)
+}
+
+const MODEL_SNAPSHOT_FORMAT: &str = "zcode-models-v1";
+
+fn is_builtin_provider(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("builtin:")
+}
+
+fn model_snapshot_from_config(config: &Value) -> Result<ModelConfigSnapshot, String> {
+    let object = config.as_object().ok_or_else(|| tr("err.models.config_object"))?;
+    let source = object.get("provider").and_then(Value::as_object).ok_or_else(|| tr("err.models.no_provider"))?;
+    let providers = source.iter()
+        .filter(|(name, _)| !is_builtin_provider(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<serde_json::Map<String, Value>>();
+    let mut selections = serde_json::Map::new();
+    for key in ["model", "small_model"] {
+        if let Some(value) = object.get(key).and_then(Value::as_str) {
+            if let Some((provider, _)) = value.split_once('/') {
+                if !is_builtin_provider(provider) {
+                    selections.insert(key.to_string(), Value::String(value.to_string()));
+                }
+            }
+        }
+    }
+    Ok(ModelConfigSnapshot {
+        format: MODEL_SNAPSHOT_FORMAT.to_string(),
+        providers: Value::Object(providers),
+        selections: Value::Object(selections),
+    })
+}
+
+fn validate_model_snapshot(value: Value) -> Result<ModelConfigSnapshot, String> {
+    let snapshot: ModelConfigSnapshot = serde_json::from_value(value).map_err(|e| trf("err.models.invalid", &[("e", &e.to_string())]))?;
+    if snapshot.format != MODEL_SNAPSHOT_FORMAT || !snapshot.providers.is_object() || !snapshot.selections.is_object() {
+        return Err(tr("err.models.invalid_format"));
+    }
+    if snapshot.providers.as_object().unwrap().keys().any(|name| is_builtin_provider(name)) {
+        return Err(tr("err.models.builtin"));
+    }
+    Ok(snapshot)
+}
+
+fn snapshot_file_name(file: &str) -> bool {
+    !file.is_empty() && file.ends_with(".json") && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+pub fn model_config_summaries(paths: &Paths) -> Result<Vec<ModelConfigSummary>, String> {
+    let dir = paths.store_dir().join("providers");
+    if !dir.exists() { return Ok(Vec::new()); }
+    let accounts = list_accounts(paths)?;
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| trf("err.models.list", &[("e", &e.to_string())]))? {
+        let path = entry.map_err(|e| trf("err.models.list", &[("e", &e.to_string())]))?.path();
+        let file = match path.file_name().and_then(|v| v.to_str()) { Some(v) if snapshot_file_name(v) => v.to_string(), _ => continue };
+        let raw = match fs::read_to_string(&path) { Ok(v) => v, Err(_) => continue };
+        if serde_json::from_str::<Value>(&raw).ok().and_then(|v| validate_model_snapshot(v).ok()).is_none() { continue; }
+        let stem = file.strip_suffix(".json").unwrap_or_default();
+        let (account_id, timestamp) = stem.split_once('_').map(|(a, t)| (a.to_string(), t.to_string())).unwrap_or_else(|| (stem.to_string(), String::new()));
+        let account_name = accounts.iter().find(|a| a.id == account_id).map(|a| a.name.clone());
+        out.push((path.metadata().and_then(|m| m.modified()).ok(), ModelConfigSummary { file, account_id, account_name, timestamp }));
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(out.into_iter().map(|(_, summary)| summary).collect())
+}
+
+pub fn extract_model_config(paths: &Paths) -> Result<ModelConfigSummary, String> {
+    let state = get_state(paths)?;
+    let account_id = state.active_account_id.ok_or_else(|| tr("err.models.no_active_account"))?;
+    let config = read_live_config(paths).ok_or_else(|| tr("err.models.no_config"))?;
+    let snapshot = model_snapshot_from_config(&config)?;
+    if snapshot.providers.as_object().is_none_or(|p| p.is_empty()) {
+        return Err(tr("err.models.no_custom_provider"));
+    }
+    let dir = paths.store_dir().join("providers");
+    fs::create_dir_all(&dir).map_err(|e| trf("err.models.mkdir", &[("e", &e.to_string())]))?;
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S%3f").to_string();
+    let file = format!("{account_id}_{timestamp}.json");
+    let path = dir.join(&file);
+    let body = serde_json::to_string_pretty(&snapshot).unwrap_or_default() + "\n";
+    atomic_write(&path, &body)?;
+    Ok(ModelConfigSummary { file, account_id: account_id.clone(), account_name: state.accounts.iter().find(|a| a.id == account_id).map(|a| a.name.clone()), timestamp })
+}
+
+pub fn inject_model_config(paths: &Paths, file: &str) -> Result<ModelConfigSummary, String> {
+    if !snapshot_file_name(file) { return Err(tr("err.models.bad_file")); }
+    let path = paths.store_dir().join("providers").join(file);
+    let root = paths.store_dir().join("providers");
+    if path.parent() != Some(root.as_path()) { return Err(tr("err.models.bad_file")); }
+    let raw = fs::read_to_string(&path).map_err(|_| tr("err.models.not_found"))?;
+    let value = serde_json::from_str::<Value>(&raw).map_err(|e| trf("err.models.invalid", &[("e", &e.to_string())]))?;
+    let snapshot = validate_model_snapshot(value)?;
+    let state = get_state(paths)?;
+    let account_id = state.active_account_id.ok_or_else(|| tr("err.models.no_active_account"))?;
+    let account = load_account(paths, &account_id)?;
+    let mut config = account.config.clone().unwrap_or_else(|| json!({}));
+    if !config.is_object() { config = json!({}); }
+    let object = config.as_object_mut().unwrap();
+    let providers = object.entry("provider").or_insert_with(|| json!({}));
+    let providers = providers.as_object_mut().ok_or_else(|| tr("err.models.no_provider"))?;
+    for (name, value) in snapshot.providers.as_object().unwrap() { providers.insert(name.clone(), value.clone()); }
+    for key in ["model", "small_model"] {
+        if let Some(value) = snapshot.selections.get(key) { object.insert(key.to_string(), value.clone()); }
+    }
+    write_live_config(paths, &config)?;
+    let mut updated = account;
+    updated.config = Some(config);
+    updated.updated_at = now_ts();
+    save_account(paths, &updated)?;
+    let stem = file.strip_suffix(".json").unwrap_or_default();
+    let (source_id, timestamp) = stem.split_once('_').map(|(a, t)| (a.to_string(), t.to_string())).unwrap_or_else(|| (stem.to_string(), String::new()));
+    Ok(ModelConfigSummary { file: file.to_string(), account_id: source_id.clone(), account_name: state.accounts.iter().find(|a| a.id == source_id).map(|a| a.name.clone()), timestamp })
 }
 
 fn in_sandbox() -> bool {
@@ -503,6 +646,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         virtual_device_mid: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
+    save_account(paths, &acc)?;
     Ok(Some(name))
 }
 
@@ -901,6 +1045,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         launch_after_switch: settings.launch_after_switch(),
         close_to_tray: settings.close_to_tray(),
         hot_switch: settings.hot_switch(),
+        auto_claim: settings.auto_claim(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
@@ -1176,6 +1321,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_claim_settings_default_and_roundtrip() {
+        let home = fake_home("auto-claim-cfg");
+        let paths = Paths::new(&home);
+        assert!(!load_settings(&paths).auto_claim(), "默认关：自动领取是可选功能");
+        let mut s = load_settings(&paths);
+        s.auto_claim = Some(true);
+        save_settings(&paths, &s).unwrap();
+        assert!(load_settings(&paths).auto_claim());
+        let mut s = load_settings(&paths);
+        s.auto_claim = Some(false);
+        save_settings(&paths, &s).unwrap();
+        assert!(!load_settings(&paths).auto_claim());
+    }
+
+    #[test]
     fn auth_proxy_gate_and_roundtrip() {
         let home = fake_home("auth-proxy");
         let paths = Paths::new(&home);
@@ -1384,5 +1544,63 @@ mod tests {
             Some("2026-08-01"),
             "其它 telemetry 字段必须保留"
         );
+    }
+
+    #[test]
+    fn model_config_extract_inject_and_auto_preserve_roundtrip() {
+        let home = fake_home("models");
+        let p = Paths::new(&home);
+        write_live_raw(&home, "M1");
+        fs::write(
+            p.live_config(),
+            serde_json::to_string(&json!({
+                "model": "acme/pro",
+                "small_model": "builtin:bigmodel-coding-plan/mini",
+                "mcp": { "keep": true },
+                "provider": {
+                    "builtin:bigmodel-coding-plan": { "options": { "apiKey": "builtin-key" } },
+                    "acme": { "name": "Acme", "options": { "apiKey": "acme-key", "baseURL": "https://acme.test" } }
+                }
+            })).unwrap(),
+        ).unwrap();
+        let a = capture_current(&p, Some("模型源".into())).unwrap();
+        let summary = extract_model_config(&p).unwrap();
+        assert_eq!(summary.account_id, a.id);
+        let snapshot_path = p.store_dir().join("providers").join(&summary.file);
+        let snapshot: Value = serde_json::from_str(&fs::read_to_string(snapshot_path).unwrap()).unwrap();
+        assert_eq!(snapshot["format"], MODEL_SNAPSHOT_FORMAT);
+        assert!(snapshot["providers"].get("acme").is_some());
+        assert!(snapshot["providers"].get("builtin:bigmodel-coding-plan").is_none());
+        assert_eq!(snapshot["selections"]["model"], "acme/pro");
+        assert!(snapshot["selections"].get("small_model").is_none());
+
+        write_live_raw(&home, "M2");
+        fs::write(
+            p.live_config(),
+            serde_json::to_string(&json!({
+                "model": "builtin:bigmodel-coding-plan/other",
+                "mcp": { "keep": true },
+                "provider": {
+                    "builtin:bigmodel-coding-plan": { "options": { "apiKey": "target-builtin" } },
+                    "other": { "options": { "apiKey": "other-key" } }
+                }
+            })).unwrap(),
+        ).unwrap();
+        let b = capture_current(&p, Some("模型目标".into())).unwrap();
+        write_live_raw(&home, "M3");
+        switch_to(&p, &b.id, false, false, false).unwrap();
+        inject_model_config(&p, &summary.file).unwrap();
+        let merged: Value = serde_json::from_str(&fs::read_to_string(p.live_config()).unwrap()).unwrap();
+        assert_eq!(merged["provider"]["acme"]["options"]["apiKey"], "acme-key");
+        assert_eq!(merged["provider"]["other"]["options"]["apiKey"], "other-key");
+        assert_eq!(merged["provider"]["builtin:bigmodel-coding-plan"]["options"]["apiKey"], "target-builtin");
+        assert_eq!(merged["model"], "acme/pro");
+        assert_eq!(merged["mcp"]["keep"], true);
+        assert_eq!(load_account(&p, &b.id).unwrap().config.unwrap()["provider"]["acme"]["options"]["apiKey"], "acme-key");
+
+        write_live_raw(&home, "M4");
+        switch_to(&p, &a.id, false, false, false).unwrap();
+        let accounts = list_accounts(&p).unwrap();
+        assert!(accounts.iter().any(|saved| saved.name.starts_with("Auto ")), "自动保留账号必须落盘");
     }
 }
