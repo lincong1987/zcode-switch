@@ -30,6 +30,10 @@ async function guard(fn) {
 const actions = {
   async refresh() { await refresh(); render(); },
 
+  async openGitHub() {
+    await invoke("open_external", { url: "https://github.com/pjpv/zcode-switch" });
+  },
+
   async setLang(l) {
     if (l === lang()) return;
     await guard(async () => {
@@ -193,6 +197,7 @@ function render() {
         <button class="btn-ghost" click="actions.savePath()">${t("common.save")}</button>
       </div>
       <div class="hint">${t("s.hint")}</div>
+      <div class="gh-row"><a class="gh-link" href="https://github.com/pjpv/zcode-switch" target="_blank" rel="noopener" click="actions.openGitHub()">${t("s.githubLink")}</a></div>
     </section>`;
 }
 

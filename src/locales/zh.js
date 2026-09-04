@@ -171,6 +171,7 @@ export const zh = {
   "s.exportAllBtn": "导出全部（加密）",
   "s.pathLabel": "ZCODE PATH · ZCode 程序路径",
   "s.browse": "浏览",
+  "s.githubLink": "GitHub 仓库 · 问题反馈与更新",
   "s.hint": "切换会同时替换 credentials.json 与 config.json；未入库的当前登录切换前会自动保存，绝不丢号。",
   "s.autostartOnToast": "已开启开机自启",
   "s.autostartOffToast": "已关闭开机自启",
