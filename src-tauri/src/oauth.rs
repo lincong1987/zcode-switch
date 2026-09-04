@@ -3,8 +3,9 @@ use crate::quota;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-pub const REDIRECT_URI: &str = "zcode://oauth/callback";
 const TOKEN_URL: &str = "https://zcode.z.ai/api/v1/oauth/token";
+const FLOW_INIT_URL: &str = "https://zcode.z.ai/api/v1/oauth/cli/init";
+pub const FLOW_TIMEOUT_MS: u64 = 300_000;
 pub const LOGIN_WINDOW_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -18,18 +19,11 @@ pub const OAUTH_PROVIDERS: &[OAuthProvider] = &[
     OAuthProvider { id: "zai", display: "z.ai（国际站）" },
 ];
 
-pub fn authorize_url(provider: &str, state: &str) -> Result<String, String> {
-    let p = urlencode(state);
-    Ok(match provider {
-        "bigmodel" => format!("https://bigmodel.cn/login?redirect={REDIRECT_ENC}&appId=zcode&state={p}"),
-        "zai" => format!(
-            "https://chat.z.ai/api/oauth/authorize?redirect_uri={REDIRECT_ENC}&response_type=code&client_id=client_P8X5CMWmlaRO9gyO-KSqtg&state={p}"
-        ),
-        _ => return Err(crate::i18n::trf("err.oauth.unknown_provider", &[("provider", provider)])),
-    })
-}
-
 const REDIRECT_ENC: &str = "zcode%3A%2F%2Foauth%2Fcallback";
+
+pub fn bridge_redirect_uri() -> String {
+    format!("https://zcode.z.ai/app/oauth/login?redirect={REDIRECT_ENC}&app_version={}", quota::zcode_app_version())
+}
 
 fn urlencode(s: &str) -> String {
     s.bytes()
@@ -40,25 +34,203 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
-pub fn parse_callback(url: &str) -> Result<(String, String), String> {
+pub struct FlowInit {
+    pub authorize_url: String,
+    pub state: String,
+    pub poll_url: String,
+    pub poll_token: String,
+    pub expires_at_ms: u128,
+    pub poll_interval_ms: u64,
+}
+
+pub fn new_poll_token() -> String {
+    let mut buf = [0u8; 32];
+    getrandom_fallback(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn init_flow(provider: &str, mid: &str) -> Result<FlowInit, String> {
+    init_flow_at(FLOW_INIT_URL, provider, mid)
+}
+
+fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String> {
+    let poll_token = new_poll_token();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build();
+    let mut req = agent.post(url);
+    for (k, v) in quota::zai_billing_headers_with_mid(&poll_token, Some(mid.to_string())) {
+        req = req.set(&k, &v);
+    }
+    let resp = req
+        .send_json(json!({ "provider": provider }))
+        .map_err(|e| crate::i18n::trf("err.oauth.init", &[("e", &e.to_string())]))?
+        .into_string()
+        .map_err(|e| crate::i18n::trf("err.oauth.init", &[("e", &e.to_string())]))?;
+    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let invalid = || crate::i18n::tr("err.oauth.init_invalid");
+    if v.get("code").and_then(|c| c.as_i64()) != Some(0) {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(crate::i18n::trf("err.oauth.init_invalid_msg", &[("msg", msg)]));
+    }
+    let data = v.get("data").ok_or_else(invalid)?;
+    let flow_id = data.get("flow_id").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        .ok_or_else(invalid)?;
+    let authorize = data.get("authorize_url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        .ok_or_else(invalid)?;
+    let expires_at_ms = data.get("expires_at").and_then(|x| x.as_f64()).map(|s| (s * 1000.0) as u128)
+        .ok_or_else(invalid)?;
+    let poll_interval_ms = data.get("poll_interval_sec").and_then(|x| x.as_f64()).map(|s| (s * 1000.0) as u64)
+        .ok_or_else(invalid)?;
+
+    let mut auth_url: tauri::Url = authorize.parse().map_err(|_| invalid())?;
+    let redirect_key = if provider == "bigmodel" { "redirect" } else { "redirect_uri" };
+    replace_query_param(&mut auth_url, redirect_key, &bridge_redirect_uri());
+    let state = auth_url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .and_then(|(_, v)| {
+            let s = v.trim().to_string();
+            (!s.is_empty()).then_some(s)
+        })
+        .ok_or_else(invalid)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let remaining = expires_at_ms.saturating_sub(now);
+    if auth_url.scheme() != "https" || remaining == 0 || poll_interval_ms < 1_000 || poll_interval_ms as u128 >= remaining {
+        return Err(invalid());
+    }
+    let init_base: String = url
+        .parse::<tauri::Url>()
+        .map(|u| u.origin().ascii_serialization())
+        .map_err(|_| invalid())?;
+    Ok(FlowInit {
+        authorize_url: auth_url.to_string(),
+        state,
+        poll_url: format!("{init_base}/api/v1/oauth/cli/poll/{}", urlencode(flow_id)),
+        poll_token,
+        expires_at_ms,
+        poll_interval_ms,
+    })
+}
+
+fn replace_query_param(url: &mut tauri::Url, key: &str, value: &str) {
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .filter(|(k, _)| k != key)
+        .collect();
+    {
+        let mut q = url.query_pairs_mut();
+        q.clear();
+        for (k, v) in kept {
+            q.append_pair(&k, &v);
+        }
+        q.append_pair(key, value);
+    }
+}
+
+#[derive(Debug)]
+pub enum PollOutcome {
+    Pending,
+    Ready(Value),
+}
+
+pub fn poll_flow_once(url: &str, poll_token: &str, mid: &str) -> Result<PollOutcome, String> {
+    let agent = web_agent();
+    let mut req = agent.get(url);
+    for (k, v) in quota::zai_billing_headers_with_mid(poll_token, Some(mid.to_string())) {
+        req = req.set(&k, &v);
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) && code != 408 && code != 429 => {
+            return Err(crate::i18n::trf("err.oauth.poll_terminal", &[("code", &code.to_string())]));
+        }
+        Err(_) => return Ok(PollOutcome::Pending),
+    };
+    let body = match resp.into_string() {
+        Ok(b) => b,
+        Err(_) => return Ok(PollOutcome::Pending),
+    };
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
+    let invalid = || crate::i18n::tr("err.oauth.poll_invalid");
+    if v.get("code").and_then(|c| c.as_i64()) != Some(0) {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(crate::i18n::trf("err.oauth.poll_invalid_msg", &[("msg", msg)]));
+    }
+    let data = v.get("data").cloned().ok_or_else(invalid)?;
+    match data.get("status").and_then(|s| s.as_str()).unwrap_or("") {
+        "pending" => Ok(PollOutcome::Pending),
+        "failed" => Err(crate::i18n::tr("err.oauth.flow_failed")),
+        "ready" => {
+            let br_str = |ptr: &str| {
+                data.pointer(ptr)
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+            };
+            let token = br_str("/token");
+            let access = match data.get("zai").or_else(|| data.get("bigmodel")) {
+                Some(p) => br_str2(p, &["access_token", "accessToken"]),
+                None => None,
+            };
+            let user_id = br_str("/user/user_id");
+            if token.is_none() || access.is_none() || user_id.is_none() {
+                return Err(invalid());
+            }
+            Ok(PollOutcome::Ready(data))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn br_str2(v: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum CallbackKind {
+    Code { code: String, state: String },
+    Attribution,
+}
+
+pub fn parse_callback(url: &str) -> Result<CallbackKind, String> {
     let rest = url
         .strip_prefix("zcode://oauth/callback")
         .ok_or_else(|| crate::i18n::tr("err.oauth.not_callback"))?;
     let qs = rest.trim_start_matches('?');
     let mut code = String::new();
     let mut state = String::new();
+    let mut has_attribution = false;
     for kv in qs.split('&') {
         let (k, v) = kv.split_once('=').ok_or_else(|| crate::i18n::tr("err.oauth.bad_cb"))?;
-        match urldecode(k) {
-            k if k == "code" => code = urldecode(v),
-            k if k == "state" => state = urldecode(v),
+        match urldecode(k).as_str() {
+            "authCode" => code = urldecode(v),
+            "code" if code.is_empty() => code = urldecode(v),
+            "state" => state = urldecode(v),
+            "channel_id" | "utm_source" | "utm_campaign" => has_attribution = true,
             _ => {}
         }
     }
-    if code.is_empty() || state.is_empty() {
-        return Err(crate::i18n::tr("err.oauth.no_code_state"));
+    if state.is_empty() {
+        return Err(crate::i18n::tr("err.oauth.state"));
     }
-    Ok((code, state))
+    if !code.is_empty() {
+        return Ok(CallbackKind::Code { code, state });
+    }
+    if has_attribution {
+        return Ok(CallbackKind::Attribution);
+    }
+    Err(crate::i18n::tr("err.oauth.no_code_state"))
 }
 
 fn urldecode(s: &str) -> String {
@@ -97,15 +269,11 @@ fn urldecode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-pub fn new_state() -> String {
-    let mut buf = [0u8; 16];
-    getrandom_fallback(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn getrandom_fallback(buf: &mut [u8]) {
-    let u = uuid::Uuid::new_v4();
-    buf.copy_from_slice(u.as_bytes());
+pub fn getrandom_fallback(buf: &mut [u8]) {
+    for chunk in buf.chunks_mut(16) {
+        let u = uuid::Uuid::new_v4();
+        chunk.copy_from_slice(&u.as_bytes()[..chunk.len()]);
+    }
 }
 
 pub fn parse_proxy_url(input: &str) -> Result<String, String> {
@@ -159,7 +327,7 @@ pub fn exchange_token(provider: &str, code: &str, state: &str, mid: &str) -> Res
         .send_json(json!({
             "provider": provider,
             "code": code,
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": bridge_redirect_uri(),
             "state": state,
         }))
         .map_err(|e| crate::i18n::trf("err.oauth.exchange_req", &[("e", &e.to_string())]))?
@@ -184,7 +352,14 @@ pub fn extract_user_profile(provider: &str, raw: &Value) -> Option<Value> {
     if provider != "zai" {
         return None;
     }
-    let u = raw.pointer("/data/user")?;
+    raw.pointer("/data/user").and_then(backend_user_profile)
+}
+
+pub fn extract_poll_user_profile(raw: &Value) -> Option<Value> {
+    raw.pointer("/data/user").and_then(backend_user_profile)
+}
+
+fn backend_user_profile(u: &Value) -> Option<Value> {
     let nonempty = |k: &str| {
         u.get(k)
             .and_then(|v| v.as_str())
@@ -254,17 +429,33 @@ pub fn fetch_userinfo(provider: &str, token: &str) -> Option<Value> {
     }))
 }
 
+pub fn extract_refresh_token(provider: &str, raw: &Value) -> Option<String> {
+    if provider != "bigmodel" {
+        return None;
+    }
+    raw.pointer("/data/bigmodel/refresh_token")
+        .or_else(|| raw.pointer("/data/bigmodel/refreshToken"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 pub fn assemble_credentials_with_token(
     provider: &str,
     jwt: &str,
     userinfo: Option<&Value>,
     access_token: Option<&str>,
+    refresh_token: Option<&str>,
 ) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("zcodejwttoken".into(), json!(jwt));
     m.insert("oauth:active_provider".into(), json!(provider));
     if let Some(at) = access_token.filter(|s| !s.trim().is_empty()) {
         m.insert(format!("oauth:{provider}:access_token"), json!(at));
+    }
+    if let Some(rt) = refresh_token.filter(|s| !s.trim().is_empty()) {
+        m.insert(format!("oauth:{provider}:refresh_token"), json!(rt));
     }
     if let Some(ui) = userinfo {
         m.insert(format!("oauth:{provider}:user_info"), json!(ui.to_string()));
@@ -476,8 +667,7 @@ pub fn assemble_config(provider: &str, jwt: &str, access_token: &str) -> Value {
             let key = if access_token.trim().is_empty() {
                 None
             } else {
-                resolve_zai_business_token(access_token.trim())
-                    .and_then(|bt| resolve_biz_api_key(ZAI_API_BASE, &format!("Bearer {bt}"), true))
+                resolve_biz_api_key(ZAI_API_BASE, &format!("Bearer {}", access_token.trim()), true)
             }
             .unwrap_or_default();
             providers.insert(
@@ -495,45 +685,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn authorize_urls_match_expected_shape() {
-        let bm = authorize_url("bigmodel", "abc123").unwrap();
-        assert!(bm.starts_with("https://bigmodel.cn/login?"));
-        assert!(bm.contains("redirect=zcode%3A%2F%2Foauth%2Fcallback"));
-        assert!(bm.contains("appId=zcode"));
-        assert!(bm.contains("state=abc123"));
-
-        let z = authorize_url("zai", "xyz").unwrap();
-        assert!(z.starts_with("https://chat.z.ai/api/oauth/authorize?"));
-        assert!(z.contains("redirect_uri=zcode%3A%2F%2Foauth%2Fcallback"));
-        assert!(z.contains("response_type=code"));
-        assert!(z.contains("client_id=client_P8X5CMWmlaRO9gyO-KSqtg"));
-        assert!(z.contains("state=xyz"));
-
-        assert!(authorize_url("nope", "s").is_err());
+    fn bridge_redirect_uri_shape() {
+        let b = bridge_redirect_uri();
+        assert!(b.starts_with("https://zcode.z.ai/app/oauth/login?redirect="), "{b}");
+        assert!(b.contains("zcode%3A%2F%2Foauth%2Fcallback"), "深链须编码：{b}");
+        assert!(b.contains("&app_version="), "{b}");
     }
 
     #[test]
-    fn callback_parsing_roundtrip() {
-        let (c, s) = parse_callback("zcode://oauth/callback?code=A%2Bb%3D&state=deadbeef").unwrap();
-        assert_eq!(c, "A+b=");
-        assert_eq!(s, "deadbeef");
-        assert!(parse_callback("zcode://oauth/callback?code=x").is_err(), "缺 state");
-        assert!(parse_callback("https://zcode.z.ai/x").is_err(), "非回调地址");
-    }
-
-    #[test]
-    fn state_is_random_hex() {
-        let a = new_state();
-        let b = new_state();
-        assert_eq!(a.len(), 32);
+    fn poll_token_is_random_hex() {
+        let a = new_poll_token();
+        let b = new_poll_token();
+        assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
     }
 
     #[test]
+    fn callback_parsing_roundtrip() {
+        let k = parse_callback("zcode://oauth/callback?code=A%2Bb%3D&state=deadbeef").unwrap();
+        assert_eq!(k, CallbackKind::Code { code: "A+b=".into(), state: "deadbeef".into() });
+        let k = parse_callback("zcode://oauth/callback?authCode=XY&state=s1").unwrap();
+        assert_eq!(k, CallbackKind::Code { code: "XY".into(), state: "s1".into() });
+        let k = parse_callback("zcode://oauth/callback?code=A&authCode=B&state=s2").unwrap();
+        assert_eq!(k, CallbackKind::Code { code: "B".into(), state: "s2".into() });
+        let k = parse_callback("zcode://oauth/callback?authCode=B&code=A&state=s3").unwrap();
+        assert_eq!(k, CallbackKind::Code { code: "B".into(), state: "s3".into() });
+        assert_eq!(parse_callback("zcode://oauth/callback?state=s&utm_source=ad").unwrap(), CallbackKind::Attribution);
+        assert_eq!(
+            parse_callback("zcode://oauth/callback?state=s&channel_id=c42").unwrap(),
+            CallbackKind::Attribution
+        );
+        assert!(parse_callback("zcode://oauth/callback?code=x").is_err(), "缺 state");
+        assert!(parse_callback("zcode://oauth/callback?state=x").is_err(), "无 code 无归因");
+        assert!(parse_callback("zcode://oauth/callback?state=s&error=denied").is_err(), "error 分支不视为归因");
+        assert!(parse_callback("https://zcode.z.ai/x").is_err(), "非回调地址");
+    }
+
+    #[test]
     fn credentials_assembly_shape() {
         let ui = json!({ "username": "ethan", "email": "e@x.com" });
-        let c = assemble_credentials_with_token("bigmodel", "JWT123", Some(&ui), None);
+        let c = assemble_credentials_with_token("bigmodel", "JWT123", Some(&ui), None, None);
         assert_eq!(c["zcodejwttoken"], "JWT123");
         assert_eq!(c["oauth:active_provider"], "bigmodel");
         let ui_str = c["oauth:bigmodel:user_info"].as_str().expect("user_info 必须为字符串");
@@ -545,7 +737,7 @@ mod tests {
     #[test]
     fn assembled_credentials_identity_roundtrip() {
         let ui = json!({ "username": "ethan", "displayName": "Ethan", "email": "e@x.com", "id": "C42" });
-        let c = assemble_credentials_with_token("bigmodel", "x".repeat(40).as_str(), Some(&ui), None);
+        let c = assemble_credentials_with_token("bigmodel", "x".repeat(40).as_str(), Some(&ui), None, None);
         let id = crate::zcrypto::identity_with_secret(&c, "any-secret");
         assert_eq!(id.username.as_deref(), Some("ethan"));
         assert_eq!(id.email.as_deref(), Some("e@x.com"));
@@ -784,13 +976,153 @@ mod tests {
         assert_eq!(resolve_zai_business_token_at(&url2, "ZAI-AT"), None);
     }
 
+    fn future_ts(sec: u64) -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + u128::from(sec) * 1000
+    }
+
+    #[test]
+    fn init_flow_rewrites_redirect_to_bridge_and_extracts_state() {
+        let init_body = json!({
+            "code": 0,
+            "data": {
+                "flow_id": "fl-abc.123",
+                "authorize_url": "https://bigmodel.cn/login?redirect=zcode%3A%2F%2Foauth%2Fcallback&appId=zcode&state=cafe01",
+                "expires_at": (future_ts(600) / 1000) as i64,
+                "poll_interval_sec": 3,
+            }
+        });
+        let (base, rx) = mock_server(vec![("POST /api/v1/oauth/cli/init", init_body)]);
+        let f = init_flow_at(&format!("{base}/api/v1/oauth/cli/init"), "bigmodel", "MID").expect("init 成功");
+        assert_eq!(f.state, "cafe01");
+        assert_eq!(f.poll_url, format!("{base}/api/v1/oauth/cli/poll/fl-abc.123"), "flow_id 须编码拼接");
+        assert!(f.poll_token.len() == 64 && f.poll_token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(f.authorize_url.starts_with("https://bigmodel.cn/login?"), "{}", f.authorize_url);
+        assert!(f.authorize_url.contains("redirect=https%3A%2F%2Fzcode.z.ai%2Fapp%2Foauth%2Flogin"), "{}", f.authorize_url);
+        assert!(f.authorize_url.contains("appId=zcode"), "{}", f.authorize_url);
+        assert!(f.authorize_url.contains("state=cafe01"), "{}", f.authorize_url);
+        assert!(f.expires_at_ms > 0);
+        assert_eq!(f.poll_interval_ms, 3000);
+        let line = rx.recv().unwrap();
+        assert!(line.starts_with("POST /api/v1/oauth/cli/init"));
+
+        let init_body = json!({
+            "code": 0,
+            "data": {
+                "flow_id": "fl-z",
+                "authorize_url": "https://chat.z.ai/api/oauth/authorize?redirect_uri=zcode%3A%2F%2Foauth%2Fcallback&response_type=code&client_id=c&state=zz11",
+                "expires_at": (future_ts(600) / 1000) as i64,
+                "poll_interval_sec": 2,
+            }
+        });
+        let (base2, _rx2) = mock_server(vec![("POST /api/v1/oauth/cli/init", init_body)]);
+        let f2 = init_flow_at(&format!("{base2}/api/v1/oauth/cli/init"), "zai", "MID").unwrap();
+        assert!(f2.authorize_url.contains("redirect_uri=https%3A%2F%2Fzcode.z.ai%2Fapp%2Foauth%2Flogin"), "{}", f2.authorize_url);
+        assert!(f2.authorize_url.contains("response_type=code"), "{}", f2.authorize_url);
+    }
+
+    #[test]
+    fn init_flow_rejects_invalid_responses() {
+        let mk = |data: Value| {
+            let (base, _rx) = mock_server(vec![("POST /api/v1/oauth/cli/init", json!({ "code": 0, "data": data }))]);
+            format!("{base}/api/v1/oauth/cli/init")
+        };
+        let full = |exp: i64, int: i64| json!({
+            "flow_id": "f", "authorize_url": "https://bigmodel.cn/login?state=st",
+            "expires_at": exp, "poll_interval_sec": int
+        });
+        assert!(init_flow_at(&mk(json!({})), "bigmodel", "M").is_err(), "空 data");
+        assert!(init_flow_at(&mk(full((future_ts(600) / 1000) as i64, 0)), "bigmodel", "M").is_err(), "间隔 0s");
+        assert!(init_flow_at(&mk(full((future_ts(600) / 1000) as i64, 999)), "bigmodel", "M").is_err(), "间隔 <1s");
+        assert!(init_flow_at(&mk(full(1, 5)), "bigmodel", "M").is_err(), "已过期");
+        let http_url = {
+            let (base, _rx) = mock_server(vec![(
+                "POST /api/v1/oauth/cli/init",
+                json!({ "code": 0, "data": {
+                    "flow_id": "f",
+                    "authorize_url": "http://bigmodel.cn/login?state=st",
+                    "expires_at": (future_ts(600) / 1000) as i64, "poll_interval_sec": 5,
+                }}),
+            )]);
+            format!("{base}/api/v1/oauth/cli/init")
+        };
+        assert!(init_flow_at(&http_url, "bigmodel", "M").is_err(), "非 https authorize");
+        let bad_code = {
+            let (base, _rx) = mock_server(vec![("POST /api/v1/oauth/cli/init", json!({ "code": 3001, "msg": "denied" }))]);
+            format!("{base}/api/v1/oauth/cli/init")
+        };
+        assert!(init_flow_at(&bad_code, "bigmodel", "M").is_err(), "code!=0");
+    }
+
+    #[test]
+    fn poll_flow_once_states() {
+        let (b, _r) = mock_server(vec![("GET /poll", json!({ "code": 0, "data": { "status": "pending" } }))]);
+        assert!(matches!(poll_flow_once(&format!("{b}/poll"), "T", "M"), Ok(PollOutcome::Pending)));
+        let ready = json!({ "code": 0, "data": {
+            "status": "ready", "token": "JWT9",
+            "user": { "user_id": "U9", "name": "Ethan" },
+            "zai": { "access_token": "ZAT" },
+        }});
+        let (b2, rx2) = mock_server(vec![("GET /poll", ready)]);
+        match poll_flow_once(&format!("{b2}/poll"), "T", "M") {
+            Ok(PollOutcome::Ready(d)) => {
+                assert_eq!(d["token"], "JWT9");
+                assert_eq!(d["zai"]["access_token"], "ZAT");
+                assert_eq!(d["user"]["user_id"], "U9");
+            }
+            other => panic!("ready 应出 Ready：{other:?}"),
+        }
+        assert!(rx2.recv().unwrap().starts_with("GET /poll"));
+        let ready_bm = json!({ "code": 0, "data": {
+            "status": "ready", "token": "J",
+            "user": { "user_id": "U" },
+            "bigmodel": { "accessToken": "BM-AT" },
+        }});
+        let (b3, _r3) = mock_server(vec![("GET /poll", ready_bm)]);
+        assert!(matches!(poll_flow_once(&format!("{b3}/poll"), "T", "M"), Ok(PollOutcome::Ready(_))));
+        let broken = json!({ "code": 0, "data": { "status": "ready", "token": "J", "user": {} } });
+        let (b4, _r4) = mock_server(vec![("GET /poll", broken)]);
+        assert!(poll_flow_once(&format!("{b4}/poll"), "T", "M").is_err());
+        for body in [
+            json!({ "code": 0, "data": { "status": "failed" } }),
+            json!({ "code": 0, "data": { "status": "weird" } }),
+            json!({ "code": 3001, "msg": "x" }),
+        ] {
+            let (b5, _r5) = mock_server(vec![("GET /poll", body.clone())]);
+            assert!(poll_flow_once(&format!("{b5}/poll"), "T", "M").is_err(), "{body}");
+        }
+        let (b6, _r6) = mock_server(vec![("GET /other", json!({}))]);
+        assert!(poll_flow_once(&format!("{b6}/poll"), "T", "M").is_err(), "404 终态");
+    }
+
     #[test]
     fn credentials_carry_access_token_conditionally() {
-        let c = assemble_credentials_with_token("bigmodel", "JWT", None, Some("BM-AT"));
+        let c = assemble_credentials_with_token("bigmodel", "JWT", None, Some("BM-AT"), None);
         assert_eq!(c["oauth:bigmodel:access_token"], "BM-AT");
-        let c = assemble_credentials_with_token("zai", "JWT", None, Some("  "));
+        let c = assemble_credentials_with_token("zai", "JWT", None, Some("  "), None);
         assert!(c.get("oauth:zai:access_token").is_none());
         assert!(c.get("oauth:bigmodel:access_token").is_none());
+        let c = assemble_credentials_with_token("bigmodel", "JWT", None, Some("AT"), Some("RT9"));
+        assert_eq!(c["oauth:bigmodel:refresh_token"], "RT9");
+        let c = assemble_credentials_with_token("bigmodel", "JWT", None, Some("AT"), Some(" "));
+        assert!(c.get("oauth:bigmodel:refresh_token").is_none());
+        let c = assemble_credentials_with_token("zai", "JWT", None, Some("BT"), Some("RT"));
+        assert_eq!(c["oauth:zai:refresh_token"], "RT");
+    }
+
+    #[test]
+    fn refresh_token_extraction_bigmodel_only() {
+        let raw = json!({ "data": { "bigmodel": { "refresh_token": " R1 " } } });
+        assert_eq!(extract_refresh_token("bigmodel", &raw).as_deref(), Some("R1"));
+        let raw = json!({ "data": { "bigmodel": { "refreshToken": "R2" } } });
+        assert_eq!(extract_refresh_token("bigmodel", &raw).as_deref(), Some("R2"));
+        let raw = json!({ "data": { "zai": { "refresh_token": "X" } } });
+        assert!(extract_refresh_token("zai", &raw).is_none());
+        let raw = json!({ "data": { "bigmodel": {} } });
+        assert!(extract_refresh_token("bigmodel", &raw).is_none());
     }
 
     #[test]
@@ -809,6 +1141,11 @@ mod tests {
         assert!(extract_user_profile("zai", &raw).is_none());
         assert!(extract_user_profile("zai", &json!({ "data": {} })).is_none());
         assert!(extract_user_profile("bigmodel", &raw).is_none());
+        let raw = json!({ "data": { "user": { "user_id": "BM1", "name": "Bo" } } });
+        let p = extract_poll_user_profile(&raw).expect("poll 路径 bigmodel 也取 data.user");
+        assert_eq!(p["id"], "BM1");
+        assert_eq!(p["username"], "Bo");
+        assert_eq!(extract_poll_user_profile(&json!({ "data": {} })), None);
         let raw = json!({ "data": { "user": { "name": "Ethan", "email": "e@x.com", "avatar": "http://a/x.png" } } });
         let p = extract_user_profile("zai", &raw).unwrap();
         assert!(p["id"].is_null(), "缺 user_id 时 id 必须为 null，不得为 unknown: {}", p["id"]);

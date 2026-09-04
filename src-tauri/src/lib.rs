@@ -314,6 +314,14 @@ struct PendingOAuth {
     flow: String,
 }
 
+#[derive(Clone)]
+struct PollCfg {
+    url: String,
+    token: String,
+    expires_at_ms: u128,
+    interval_ms: u64,
+}
+
 static PENDING_OAUTH: Mutex<Option<PendingOAuth>> = Mutex::new(None);
 
 fn pending_oauth_guard() -> std::sync::MutexGuard<'static, Option<PendingOAuth>> {
@@ -344,10 +352,24 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     if let Some(w) = app.get_webview_window("login") {
         let _ = w.close();
     }
-    let state = oauth::new_state();
     let flow = uuid::Uuid::new_v4().to_string();
-    let url = oauth::authorize_url(&provider, &state)?;
-    *pending_oauth_guard() = Some(PendingOAuth { provider: provider.clone(), state: state.clone(), flow: flow.clone() });
+    let mid = uuid::Uuid::new_v4().to_string();
+    let (p_init, m_init) = (provider.clone(), mid.clone());
+    let init = tauri::async_runtime::spawn_blocking(move || oauth::init_flow(&p_init, &m_init))
+        .await
+        .map_err(|e| i18n::trf("err.oauth.flow", &[("e", &e.to_string())]))??;
+    let url = init.authorize_url.clone();
+    let poll_cfg = PollCfg {
+        url: init.poll_url.clone(),
+        token: init.poll_token.clone(),
+        expires_at_ms: init.expires_at_ms,
+        interval_ms: init.poll_interval_ms,
+    };
+    *pending_oauth_guard() = Some(PendingOAuth {
+        provider: provider.clone(),
+        state: init.state.clone(),
+        flow: flow.clone(),
+    });
 
     let login_root = app
         .path()
@@ -358,7 +380,8 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     let profile_dir = login_root.join(&flow);
 
     let app2 = app.clone();
-    let (provider2, state2, flow2) = (provider.clone(), state.clone(), flow.clone());
+    let (provider2, state2, flow2, mid2) = (provider.clone(), init.state.clone(), flow.clone(), mid.clone());
+    let flow_close = flow.clone();
     let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "login",
@@ -380,17 +403,31 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             return true;
         }
         let full = url.to_string();
-        let (app3, p3, s3, f3) = (app2.clone(), provider2.clone(), state2.clone(), flow2.clone());
+        let (app3, p3, s3, f3, m3) = (app2.clone(), provider2.clone(), state2.clone(), flow2.clone(), mid2.clone());
         tauri::async_runtime::spawn(async move {
-            finish_oauth(&app3, p3, s3, f3, &full).await;
+            finish_oauth(&app3, p3, s3, f3, m3, &full).await;
         });
         false
     })
     .build()
     .map_err(|e| {
-        *pending_oauth_guard() = None;
+        let mut pending = pending_oauth_guard();
+        if pending.as_ref().map(|p| p.flow == flow).unwrap_or(false) {
+            *pending = None;
+        }
         i18n::trf("err.oauth.window", &[("e", &e.to_string())])
     })?;
+    if let Some(w) = app.get_webview_window("login") {
+        w.on_window_event(move |e| {
+            if let tauri::WindowEvent::CloseRequested { .. } = e {
+                let mut pending = pending_oauth_guard();
+                if pending.as_ref().map(|p| p.flow == flow_close).unwrap_or(false) {
+                    *pending = None;
+                }
+            }
+        });
+    }
+    spawn_poll_loop(app.clone(), provider.clone(), flow.clone(), mid, poll_cfg);
     Ok(json!({ "opened": true, "provider": provider }))
 }
 
@@ -427,20 +464,14 @@ async fn set_auth_proxy(app: AppHandle, on: bool, url: Option<String>) -> Result
     Ok(())
 }
 
-async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: String, callback_url: &str) {
-    let paths = Paths::detect();
+async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: String, mid: String, callback_url: &str) {
     let result = {
         let provider = provider.clone();
         let state = state.clone();
         let flow = flow.clone();
+        let mid = mid.clone();
         let callback_url = callback_url.to_string();
         tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
-            let flow_still_ours = || {
-                pending_oauth_guard()
-                    .as_ref()
-                    .map(|p| p.flow == flow)
-                    .unwrap_or(false)
-            };
             {
                 let pending = pending_oauth_guard();
                 match pending.as_ref() {
@@ -448,81 +479,127 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
                     Some(_) | None => return Err("__superseded__".into()),
                 }
             }
-            let (code, cb_state) = oauth::parse_callback(&callback_url)?;
+            let (code, cb_state) = match oauth::parse_callback(&callback_url)? {
+                oauth::CallbackKind::Attribution => return Err("__attribution__".into()),
+                oauth::CallbackKind::Code { code, state } => (code, state),
+            };
             if cb_state != state {
                 return Err(i18n::tr("err.oauth.state"));
             }
-            let mid = uuid::Uuid::new_v4().to_string();
             let exchanged = oauth::exchange_token(&provider, &code, &state, &mid)?;
-            let jwt = exchanged["jwt"].as_str().unwrap_or_default().to_string();
-            let access_token = oauth::extract_access_token(&provider, &exchanged["raw"])
-                .unwrap_or_default();
-            let userinfo = oauth::extract_user_profile(&provider, &exchanged["raw"]).or_else(|| {
-                (!access_token.is_empty())
-                    .then(|| oauth::fetch_userinfo(&provider, &access_token))
-                    .flatten()
-            });
-            let credentials = oauth::assemble_credentials_with_token(
-                &provider,
-                &jwt,
-                userinfo.as_ref(),
-                (!access_token.is_empty()).then_some(access_token.as_str()),
-            );
-            let config = oauth::assemble_config(&provider, &jwt, &access_token);
-
-            let accounts = list_accounts(&paths)?;
-            let hash = canonical_hash(&credentials);
-            if let Some(i) = store::find_same_login(&credentials, &hash, &accounts, &paths.home) {
-                let mut dup = accounts[i].clone();
-                dup.hash = hash.clone();
-                dup.credentials = credentials;
-                dup.config = Some(config);
-                dup.updated_at = now_ts();
-                if dup.virtual_device_mid.as_deref().map_or(true, |m| m.trim().is_empty()) {
-                    dup.virtual_device_mid = Some(mid);
-                }
-                if !flow_still_ours() {
-                    return Err("__superseded__".into());
-                }
-                save_account(&paths, &dup)?;
-                *pending_oauth_guard() = None;
-                return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
-            }
-            let base = credentials
-                .get(format!("oauth:{provider}:user_info"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .and_then(|u| u.get("username").and_then(|x| x.as_str()).map(String::from))
-                .unwrap_or_else(|| match provider.as_str() {
-                    "zai" => "z.ai".to_string(),
-                    _ => "BigModel".to_string(),
-                });
-            let name = unique_name(&accounts, &base);
-            let ts = now_ts();
-            let acc = Account {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: name.clone(),
-                created_at: ts.clone(),
-                updated_at: ts,
-                hash,
-                credentials,
-                config: Some(config),
-                virtual_device_mid: Some(mid),
-                virtual_arms_uid: Some(store::new_arms_uid()),
-            };
-            if !flow_still_ours() {
-                return Err("__superseded__".into());
-            }
-            save_account(&paths, &acc)?;
-            *pending_oauth_guard() = None;
-            Ok(json!({ "id": acc.id, "name": acc.name, "provider": provider }))
+            persist_oauth_account(&Paths::detect(), &provider, &exchanged["raw"], &flow, &mid, false)
         })
         .await
         .unwrap_or_else(|e| Err(i18n::trf("err.oauth.flow", &[("e", &e.to_string())])))
     };
+    finalize_oauth_result(app, result);
+}
 
+fn persist_oauth_account(
+    paths: &Paths,
+    provider: &str,
+    raw: &serde_json::Value,
+    flow: &str,
+    mid: &str,
+    poll_ready: bool,
+) -> Result<serde_json::Value, String> {
+    let flow_still_ours = || {
+        pending_oauth_guard()
+            .as_ref()
+            .map(|p| p.flow == flow)
+            .unwrap_or(false)
+    };
+    if !flow_still_ours() {
+        return Err("__superseded__".into());
+    }
+    let jwt = raw
+        .pointer("/data/token")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| i18n::tr("err.oauth.no_token"))?
+        .to_string();
+    let raw_access = oauth::extract_access_token(provider, raw).unwrap_or_default();
+    let access_token = if provider == "zai" && !raw_access.is_empty() {
+        oauth::resolve_zai_business_token(&raw_access).ok_or_else(|| i18n::tr("err.oauth.zai_business"))?
+    } else {
+        raw_access
+    };
+    let userinfo = if poll_ready {
+        oauth::extract_poll_user_profile(raw)
+    } else {
+        oauth::extract_user_profile(provider, raw)
+    }
+    .or_else(|| {
+        (!access_token.is_empty())
+            .then(|| oauth::fetch_userinfo(provider, &access_token))
+            .flatten()
+    });
+    let refresh_token = oauth::extract_refresh_token(provider, raw);
+    let credentials = oauth::assemble_credentials_with_token(
+        provider,
+        &jwt,
+        userinfo.as_ref(),
+        (!access_token.is_empty()).then_some(access_token.as_str()),
+        refresh_token.as_deref(),
+    );
+    let config = oauth::assemble_config(provider, &jwt, &access_token);
+
+    let _lock = store_guard();
+    if !flow_still_ours() {
+        return Err("__superseded__".into());
+    }
+    let accounts = list_accounts(paths)?;
+    let hash = canonical_hash(&credentials);
+    if let Some(i) = store::find_same_login(&credentials, &hash, &accounts, &paths.home) {
+        let mut dup = accounts[i].clone();
+        dup.hash = hash.clone();
+        dup.credentials = credentials;
+        dup.config = Some(config);
+        dup.updated_at = now_ts();
+        if dup.virtual_device_mid.as_deref().map_or(true, |m| m.trim().is_empty()) {
+            dup.virtual_device_mid = Some(mid.to_string());
+        }
+        if !flow_still_ours() {
+            return Err("__superseded__".into());
+        }
+        save_account(paths, &dup)?;
+        *pending_oauth_guard() = None;
+        return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
+    }
+    let base = credentials
+        .get(format!("oauth:{provider}:user_info"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|u| u.get("username").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or_else(|| match provider {
+            "zai" => "z.ai".to_string(),
+            _ => "BigModel".to_string(),
+        });
+    let name = unique_name(&accounts, &base);
+    let ts = now_ts();
+    let acc = Account {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.clone(),
+        created_at: ts.clone(),
+        updated_at: ts,
+        hash,
+        credentials,
+        config: Some(config),
+        virtual_device_mid: Some(mid.to_string()),
+        virtual_arms_uid: Some(store::new_arms_uid()),
+    };
+    if !flow_still_ours() {
+        return Err("__superseded__".into());
+    }
+    save_account(paths, &acc)?;
+    *pending_oauth_guard() = None;
+    Ok(json!({ "id": acc.id, "name": acc.name, "provider": provider }))
+}
+
+fn finalize_oauth_result(app: &AppHandle, result: Result<serde_json::Value, String>) {
     if let Err(e) = &result {
-        if e == "__superseded__" {
+        if e == "__superseded__" || e == "__attribution__" {
             return;
         }
     }
@@ -534,6 +611,55 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
         Err(e) => json!({ "ok": false, "error": e }),
     };
     let _ = app.emit("oauth://done", &payload);
+}
+
+fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, cfg: PollCfg) {
+    std::thread::spawn(move || {
+        let ours = || pending_oauth_guard().as_ref().map(|p| p.flow == flow).unwrap_or(false);
+        let deadline = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            std::cmp::min(cfg.expires_at_ms, now + u128::from(oauth::FLOW_TIMEOUT_MS))
+        };
+        loop {
+            if !ours() {
+                return;
+            }
+            match oauth::poll_flow_once(&cfg.url, &cfg.token, &mid) {
+                Ok(oauth::PollOutcome::Pending) => {}
+                Ok(oauth::PollOutcome::Ready(data)) => {
+                    let raw = json!({ "code": 0, "data": data });
+                    let result = persist_oauth_account(&Paths::detect(), &provider, &raw, &flow, &mid, true);
+                    finalize_oauth_result(&app, result);
+                    return;
+                }
+                Err(e) => {
+                    if !ours() {
+                        return;
+                    }
+                    *pending_oauth_guard() = None;
+                    finalize_oauth_result(&app, Err(e));
+                    return;
+                }
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            if now >= deadline {
+                if !ours() {
+                    return;
+                }
+                *pending_oauth_guard() = None;
+                finalize_oauth_result(&app, Err(i18n::tr("err.oauth.expired")));
+                return;
+            }
+            let sleep = (deadline - now).min(cfg.interval_ms as u128) as u64;
+            std::thread::sleep(std::time::Duration::from_millis(sleep));
+        }
+    });
 }
 
 fn open_captcha_window(app: &AppHandle) -> Result<(), String> {
@@ -913,9 +1039,6 @@ pub fn run() {
                 }
                 if window.label() == "captcha" {
                     *pending_guard() = None;
-                }
-                if window.label() == "login" {
-                    *pending_oauth_guard() = None;
                 }
             }
         })

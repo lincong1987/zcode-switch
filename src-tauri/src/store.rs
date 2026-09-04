@@ -656,6 +656,11 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
         (false, Some(at)) => at.trim().to_string(),
         (false, None) => String::new(),
     };
+    let access_token = if provider == "zai" && !access_token.is_empty() {
+        crate::oauth::resolve_zai_business_token(&access_token).unwrap_or(access_token)
+    } else {
+        access_token
+    };
     let fresh = crate::oauth::assemble_config(&provider, &jwt, &access_token);
     let Some(fresh_map) = fresh.get("provider").and_then(|v| v.as_object()) else { return; };
     let mut live_prov = live_prov.clone();
@@ -709,9 +714,9 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
                 eprintln!("sync-back 失败(不阻断 already 返回): {e}");
             }
         }
-        let mid = ensure_virtual_device_mid(paths, &target.id)?;
+        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
         write_live_device_mid(paths, &mid)?;
-        let uid = ensure_virtual_arms_uid(paths, &target.id)?;
+        let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
         if !zcode_running() {
             let _ = write_live_arms_uid(paths, &uid);
         }
@@ -736,9 +741,9 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         let preserved_as = auto_preserve(paths, &accounts, &target.hash)?;
         hot_swap_verified(paths, &target)?;
         reset_live_plan_cache(paths);
-        let mid = ensure_virtual_device_mid(paths, &target.id)?;
+        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
         write_live_device_mid(paths, &mid)?;
-        ensure_virtual_arms_uid(paths, &target.id)?;
+        ensure_virtual_arms_uid_locked(paths, &target.id)?;
         return Ok(SwitchResult {
             switched: true,
             already_active: false,
@@ -776,9 +781,9 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     reset_live_plan_cache(paths);
     align_family_domain(paths, &target);
     rematerialize_wiped_builtins(paths, &target);
-    let mid = ensure_virtual_device_mid(paths, &target.id)?;
+    let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
     write_live_device_mid(paths, &mid)?;
-    let uid = ensure_virtual_arms_uid(paths, &target.id)?;
+    let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
     let _ = write_live_arms_uid(paths, &uid);
 
     let mut launched = false;
@@ -934,7 +939,7 @@ pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, St
     quota::quota_for_snapshot(&paths.home, &acc.credentials, acc.config.as_ref())
 }
 
-pub fn ensure_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, String> {
+fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {
     {
         let acc = load_account(paths, id)?;
         if let Some(m) = acc.virtual_device_mid.clone() {
@@ -943,21 +948,29 @@ pub fn ensure_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, Stri
             }
         }
     }
-    let mid = {
-        let _guard = crate::store_guard();
-        let mut acc = load_account(paths, id)?;
+    let mut acc = load_account(paths, id)?;
+    if let Some(m) = acc.virtual_device_mid.clone() {
+        if !m.trim().is_empty() {
+            return Ok(m);
+        }
+    }
+    let m = Uuid::new_v4().to_string();
+    acc.virtual_device_mid = Some(m.clone());
+    acc.updated_at = now_ts();
+    save_account(paths, &acc)?;
+    Ok(m)
+}
+
+pub fn ensure_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, String> {
+    if let Ok(acc) = load_account(paths, id) {
         if let Some(m) = acc.virtual_device_mid.clone() {
             if !m.trim().is_empty() {
                 return Ok(m);
             }
         }
-        let m = Uuid::new_v4().to_string();
-        acc.virtual_device_mid = Some(m.clone());
-        acc.updated_at = now_ts();
-        save_account(paths, &acc)?;
-        m
-    };
-    Ok(mid)
+    }
+    let _guard = crate::store_guard();
+    ensure_virtual_device_mid_locked(paths, id)
 }
 
 pub fn write_live_device_mid(paths: &Paths, mid: &str) -> Result<(), String> {
@@ -1085,7 +1098,7 @@ fn arms_store_dirs_for(paths: &Paths) -> Vec<PathBuf> {
     arms_store_dirs_from(appdata, mac_base, unix_base)
 }
 
-pub fn ensure_virtual_arms_uid(paths: &Paths, id: &str) -> Result<String, String> {
+fn ensure_virtual_arms_uid_locked(paths: &Paths, id: &str) -> Result<String, String> {
     {
         let acc = load_account(paths, id)?;
         if let Some(u) = acc.virtual_arms_uid.clone() {
@@ -1094,21 +1107,17 @@ pub fn ensure_virtual_arms_uid(paths: &Paths, id: &str) -> Result<String, String
             }
         }
     }
-    let uid = {
-        let _guard = crate::store_guard();
-        let mut acc = load_account(paths, id)?;
-        if let Some(u) = acc.virtual_arms_uid.clone() {
-            if !u.trim().is_empty() {
-                return Ok(u);
-            }
+    let mut acc = load_account(paths, id)?;
+    if let Some(u) = acc.virtual_arms_uid.clone() {
+        if !u.trim().is_empty() {
+            return Ok(u);
         }
-        let u = new_arms_uid();
-        acc.virtual_arms_uid = Some(u.clone());
-        acc.updated_at = now_ts();
-        save_account(paths, &acc)?;
-        u
-    };
-    Ok(uid)
+    }
+    let u = new_arms_uid();
+    acc.virtual_arms_uid = Some(u.clone());
+    acc.updated_at = now_ts();
+    save_account(paths, &acc)?;
+    Ok(u)
 }
 
 fn read_live_arms_uid_from(dirs: &[PathBuf]) -> Option<String> {
@@ -2450,7 +2459,7 @@ mod tests {
         let u0 = acc.virtual_arms_uid.expect("capture 应已生成虚拟 uid");
         assert!(u0.starts_with("uid_") && u0.len() == 20);
 
-        let u1 = ensure_virtual_arms_uid(&p, &acc.id).unwrap();
+        let u1 = ensure_virtual_arms_uid_locked(&p, &acc.id).unwrap();
         assert_eq!(u0, u1, "ensure 必须复用已有 uid");
         let reloaded = load_account(&p, &acc.id).unwrap();
         assert_eq!(reloaded.virtual_arms_uid.as_deref(), Some(u1.as_str()), "必须落盘快照");
@@ -2474,5 +2483,113 @@ mod tests {
         switch_to(&p, &b.id, false, false, false).unwrap();
         let got = read_live_arms_uid_from(&[arms_dir(&home)]).expect("切换后沙箱 ARMS 存储必须有 uid");
         assert_eq!(got, b.virtual_arms_uid.unwrap(), "切换后 ARMS uid 必须是目标账号的");
+    }
+
+    #[test]
+    fn switch_to_under_held_store_lock_with_legacy_account_completes() {
+        let home = fake_home("lockreg");
+        let p = Paths::new(&home);
+        write_live_raw(&home, "S1");
+        let _ = capture_current(&p, Some("源号".into())).unwrap();
+
+        let mut legacy = Account {
+            id: Uuid::new_v4().to_string(),
+            name: "老账号".into(),
+            created_at: now_ts(),
+            updated_at: now_ts(),
+            hash: String::new(),
+            credentials: json!({
+                "oauth:bigmodel:access_token": "enc:v1:AAAlegacy",
+                "oauth:bigmodel:user_info": "enc:v1:BBBB",
+                "oauth:active_provider": "enc:v1:CCCC",
+                "zcodejwttoken": "enc:v1:DDDD",
+            }),
+            config: None,
+            virtual_device_mid: None,
+            virtual_arms_uid: None,
+        };
+        legacy.hash = canonical_hash(&legacy.credentials);
+        save_account(&p, &legacy).unwrap();
+
+        write_live_raw(&home, "S1");
+
+        let home2 = home.clone();
+        let target_id = legacy.id.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        std::thread::spawn(move || {
+            let p2 = Paths::new(&home2);
+            let _guard = crate::store_guard();
+            let _ = tx.send(switch_to(&p2, &target_id, true, false, false).map(|_| ()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("持锁切换存量账号应成功：{e}"),
+            Err(_) => panic!("switch_to 在外层持 STORE_LOCK 时死锁（issue #3 回归）"),
+        }
+
+        let reloaded = load_account(&p, &legacy.id).unwrap();
+        assert!(
+            reloaded.virtual_device_mid.as_deref().is_some_and(|m| !m.trim().is_empty()),
+            "冷切换必须补齐存量账号的 mid"
+        );
+        assert!(
+            reloaded.virtual_arms_uid.as_deref().is_some_and(|u| !u.trim().is_empty()),
+            "冷切换必须补齐存量账号的 arms uid"
+        );
+    }
+
+    #[test]
+    fn switch_to_already_path_under_held_store_lock_with_legacy_account_completes() {
+        let home = fake_home("lockreg2");
+        let p = Paths::new(&home);
+
+        let mut legacy = Account {
+            id: Uuid::new_v4().to_string(),
+            name: "老账号".into(),
+            created_at: now_ts(),
+            updated_at: now_ts(),
+            hash: String::new(),
+            credentials: json!({
+                "oauth:bigmodel:access_token": "enc:v1:AAAlegacy",
+                "oauth:bigmodel:user_info": "enc:v1:BBBB",
+                "oauth:active_provider": "enc:v1:CCCC",
+                "zcodejwttoken": "enc:v1:DDDD",
+            }),
+            config: None,
+            virtual_device_mid: None,
+            virtual_arms_uid: None,
+        };
+        legacy.hash = canonical_hash(&legacy.credentials);
+        save_account(&p, &legacy).unwrap();
+
+        fs::write(
+            p.live_file(),
+            serde_json::to_string(&legacy.credentials).unwrap(),
+        )
+        .unwrap();
+
+        let home2 = home.clone();
+        let target_id = legacy.id.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<SwitchResult, String>>();
+        std::thread::spawn(move || {
+            let p2 = Paths::new(&home2);
+            let _guard = crate::store_guard();
+            let _ = tx.send(switch_to(&p2, &target_id, false, false, false));
+        });
+        let r = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(v) => v.expect("持锁 already 切换应成功"),
+            Err(_) => panic!("switch_to already 路径在外层持 STORE_LOCK 时死锁（issue #3 回归）"),
+        };
+        assert!(r.already_active && !r.switched, "前置条件：必须命中 already 分支");
+
+        let reloaded = load_account(&p, &legacy.id).unwrap();
+        assert!(
+            reloaded.virtual_device_mid.as_deref().is_some_and(|m| !m.trim().is_empty()),
+            "already 对齐必须补齐存量账号的 mid"
+        );
+        assert!(
+            reloaded.virtual_arms_uid.as_deref().is_some_and(|u| !u.trim().is_empty()),
+            "already 对齐必须补齐存量账号的 arms uid"
+        );
     }
 }
