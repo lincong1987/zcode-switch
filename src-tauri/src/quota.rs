@@ -168,7 +168,16 @@ pub(crate) fn zai_billing_headers(token: &str) -> Vec<(String, String)> {
 }
 
 pub(crate) fn zai_billing_headers_with_mid(token: &str, mid: Option<String>) -> Vec<(String, String)> {
-    let ver = zcode_app_version();
+    zai_headers_with_version(zcode_app_version(), token, mid)
+}
+
+pub(crate) struct OAuthFlowHeaders(pub Vec<(String, String)>);
+
+pub(crate) fn zai_oauth_headers_with_mid(token: &str, mid: Option<String>) -> OAuthFlowHeaders {
+    OAuthFlowHeaders(zai_headers_with_version(CLIENT_APP_VERSION.to_string(), token, mid))
+}
+
+fn zai_headers_with_version(ver: String, token: &str, mid: Option<String>) -> Vec<(String, String)> {
     let mut h: Vec<(String, String)> = vec![
         ("User-Agent".into(), format!("ZCode/{ver}")),
         ("HTTP-Referer".into(), ZCODE_ORIGIN.into()),
