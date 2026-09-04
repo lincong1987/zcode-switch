@@ -72,6 +72,7 @@ export const en = {
   "m.claimOk": "\"{name}\" claimed \"{plan}\"",
   "m.claimStartsAt": "Credits activate at {time}",
   "m.claimEndsAt": "Valid until {time}",
+  "m.claimNextAt": " — available again after {time}",
   "m.unknownErr": "Unknown error",
   "m.oauthFail": "Failed to add account: {err}",
   "m.oauthDup": "This login is already in the store: \"{name}\"",

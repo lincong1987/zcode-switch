@@ -269,25 +269,29 @@ async fn claim_captcha_submit(
                     .and_then(|x| x.as_i64())
                     .map(|s| s * 1000)
             };
+            let server_time = v
+                .pointer("/data/server_time")
+                .and_then(|x| x.as_i64())
+                .map(|s| s * 1000);
             let outcome = claim::ClaimOutcome {
                 account_id: pending.account_id.clone(),
                 account_name: pending.account_name.clone(),
                 plan_name: pending.plan_name.clone(),
                 starts_at: ms("starts_at"),
                 ends_at: ms("ends_at"),
+                server_time,
             };
             let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
             let _ = app.emit("claim://result", &p);
             p
         }
         Err(e) => {
-            let p = json!({
-                "ok": false,
-                "accountId": pending.account_id,
-                "accountName": pending.account_name,
-                "planName": pending.plan_name,
-                "message": e,
-            });
+            let p = claim::failure_payload(
+                &pending.account_id,
+                &pending.account_name,
+                &pending.plan_name,
+                &e,
+            );
             let _ = app.emit("claim://result", &p);
             return Ok(p);
         }

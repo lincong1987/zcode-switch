@@ -72,6 +72,7 @@ export const zh = {
   "m.claimOk": "「{name}」已领取「{plan}」",
   "m.claimStartsAt": "额度将于 {time} 生效",
   "m.claimEndsAt": "有效期至 {time}",
+  "m.claimNextAt": "，{time} 后可再领",
   "m.unknownErr": "未知错误",
   "m.oauthFail": "添加账号失败：{err}",
   "m.oauthDup": "该登录已在账号库中：「{name}」",

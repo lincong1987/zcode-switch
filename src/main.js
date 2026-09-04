@@ -642,10 +642,15 @@ listen("claim://result", (ev) => {
   const p = ev.payload || {};
   if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
   if (p.ok === false) {
-    toast(t("m.claimFailed", { name: p.accountName, msg: p.message || t("m.unknownErr") }), "err");
+    let msg = p.message || t("m.unknownErr");
+    if (p.code === 1005 && p.nextAt) {
+      msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
+    }
+    toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
   } else {
     const bits = [];
-    if (p.startsAt) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
+    const now = p.serverTime || Date.now();
+    if (p.startsAt && p.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
     if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
     toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
   }
