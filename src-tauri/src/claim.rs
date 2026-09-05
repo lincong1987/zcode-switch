@@ -127,6 +127,93 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+pub const EVENT_REPORT_URL: &str = "https://zcode.z.ai/api/v1/event/report";
+pub const ACTIVATION_EVENTS: [&str; 2] = ["app_launch", "app_daily_active"];
+const SCREEN_RESOLUTION: &str = "2560x1440";
+const ACTIVATION_TIMEOUT_SECS: u64 = 10;
+
+pub(crate) fn telemetry_user_id(home: &Path, creds: &Value) -> Option<String> {
+    let secret = zcrypto::default_secret(home);
+    let provider = creds
+        .get("oauth:active_provider")
+        .and_then(|v| v.as_str())
+        .and_then(|v| decrypt_credential(v, &secret))
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "zai".to_string());
+    let raw = creds
+        .get(format!("oauth:{provider}:user_info"))?
+        .as_str()?;
+    let plain = decrypt_credential(raw, &secret)?;
+    let info: Value = serde_json::from_str(&plain).ok()?;
+    let pick = |k: &str| {
+        info.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    pick("id").or_else(|| pick("user_id")).map(String::from)
+}
+
+fn activation_event_body(element: &str, event_id: &str, user_id: &str, mid: &str) -> Value {
+    serde_json::json!({
+        "event_id": event_id,
+        "client_timezone": quota::client_timezone(),
+        "client_language": quota::ZCODE_LANG,
+        "element_name": element,
+        "event_region": "app",
+        "event_type": "view",
+        "event_text": "",
+        "event_extra_detail": {},
+        "user_id": user_id,
+        "screen_resolution": SCREEN_RESOLUTION,
+        "app_version": quota::zcode_app_version(),
+        "device_os_category": device_os_category(),
+        "device_os_version": quota::os_version().unwrap_or_default(),
+        "device_mid": mid,
+        "mac_id": "",
+        "marketing_params": "{}",
+    })
+}
+
+fn device_os_category() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "windows",
+        "macos" => "macos",
+        _ => "linux",
+    }
+}
+
+pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
+        .build();
+    for element in ACTIVATION_EVENTS {
+        let body = activation_event_body(
+            element,
+            &uuid::Uuid::new_v4().to_string(),
+            user_id,
+            device_mid,
+        );
+        let resp = agent
+            .post(EVENT_REPORT_URL)
+            .set("Content-Type", "application/json")
+            .send_json(body)
+            .map_err(|e| {
+                crate::i18n::trf("err.claim.activate_req", &[("e", http_err("", e).trim())])
+            })?
+            .into_string()
+            .map_err(|e| crate::i18n::trf("err.claim.activate_req", &[("e", &e.to_string())]))?;
+        let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(failure_message(code, &v));
+        }
+    }
+    Ok(())
+}
+
 pub fn preview_plans(
     home: &Path,
     creds: &Value,
@@ -509,5 +596,184 @@ mod tests {
         assert!(p.get("account_id").is_none(), "不得残留 snake_case 键");
         assert!(p.get("next_at").is_none());
         assert_eq!(p["nextAt"], serde_json::json!(1787900000_000i64));
+    }
+
+    #[test]
+    fn telemetry_user_id_prefers_id() {
+        let creds = json!({ "oauth:active_provider": "zai", "oauth:zai:user_info": r#"{"id":"X","user_id":"Y"}"# });
+        assert_eq!(telemetry_user_id(Path::new("zsw-test-home"), &creds), Some("X".to_string()));
+    }
+
+    #[test]
+    fn telemetry_user_id_falls_back_to_user_id() {
+        let only = json!({ "oauth:active_provider": "zai", "oauth:zai:user_info": r#"{"user_id":"Y"}"# });
+        assert_eq!(telemetry_user_id(Path::new("zsw-test-home"), &only), Some("Y".to_string()));
+        let blank_id = json!({ "oauth:active_provider": "zai", "oauth:zai:user_info": r#"{"id":"  ","user_id":"Y"}"# });
+        assert_eq!(telemetry_user_id(Path::new("zsw-test-home"), &blank_id), Some("Y".to_string()));
+    }
+
+    #[test]
+    fn telemetry_user_id_follows_active_provider() {
+        let creds = json!({
+            "oauth:active_provider": "bigmodel",
+            "oauth:zai:user_info": r#"{"id":"ZAI"}"#,
+            "oauth:bigmodel:user_info": r#"{"id":"BM-ID"}"#
+        });
+        assert_eq!(telemetry_user_id(Path::new("zsw-test-home"), &creds), Some("BM-ID".to_string()));
+    }
+
+    #[test]
+    fn telemetry_user_id_provider_missing_or_empty() {
+        assert_eq!(telemetry_user_id(Path::new("zsw-test-home"), &json!({})), None);
+        assert_eq!(
+            telemetry_user_id(Path::new("zsw-test-home"), &json!({ "oauth:active_provider": "  " })),
+            None
+        );
+        assert_eq!(
+            telemetry_user_id(Path::new("zsw-test-home"), &json!({ "oauth:active_provider": "zai" })),
+            None
+        );
+    }
+
+    #[test]
+    fn telemetry_user_id_missing_or_malformed() {
+        assert_eq!(
+            telemetry_user_id(Path::new("zsw-test-home"), &json!({ "oauth:active_provider": "zai", "oauth:zai:user_info": "not-json" })),
+            None
+        );
+        assert_eq!(
+            telemetry_user_id(Path::new("zsw-test-home"), &json!({ "oauth:active_provider": "zai", "oauth:zai:user_info": r#"{"id":"","user_id":" "}"# })),
+            None
+        );
+        assert_eq!(
+            telemetry_user_id(Path::new("zsw-test-home"), &json!({ "oauth:active_provider": "zai", "oauth:zai:user_info": 42 })),
+            None
+        );
+    }
+
+    #[test]
+    fn telemetry_user_id_decrypts_enc_value() {
+        let home = Path::new("zsw-test-home");
+        let secret = zcrypto::default_secret(home);
+        let enc = zcrypto::encrypt_with_secret(r#"{"id":"ENC-ID","user_id":"FALLBACK"}"#, &secret)
+            .expect("测试加密失败");
+        let creds = json!({ "oauth:active_provider": "zai", "oauth:zai:user_info": enc });
+        assert_eq!(telemetry_user_id(home, &creds), Some("ENC-ID".to_string()));
+    }
+
+    #[test]
+    fn telemetry_user_id_undecryptable_is_none() {
+        let creds = json!({ "oauth:active_provider": "zai", "oauth:zai:user_info": "enc:v1:AAAA.BBBB.CCCC" });
+        assert_eq!(telemetry_user_id(Path::new("zsw-test-home"), &creds), None);
+    }
+
+    #[test]
+    fn telemetry_user_id_falls_back_to_zai_without_active_provider() {
+        let missing = json!({ "oauth:zai:user_info": r#"{"id":"LEGACY"}"# });
+        assert_eq!(
+            telemetry_user_id(Path::new("zsw-test-home"), &missing),
+            Some("LEGACY".to_string())
+        );
+        let undecryptable = json!({
+            "oauth:active_provider": "enc:v1:AAAA.BBBB.CCCC",
+            "oauth:zai:user_info": r#"{"id":"LEGACY2"}"#
+        });
+        assert_eq!(
+            telemetry_user_id(Path::new("zsw-test-home"), &undecryptable),
+            Some("LEGACY2".to_string())
+        );
+        assert_eq!(
+            telemetry_user_id(Path::new("zsw-test-home"), &json!({ "zcodejwttoken": "J" })),
+            None
+        );
+    }
+
+    #[test]
+    fn telemetry_user_id_no_cross_provider_fallback() {
+        let creds = json!({
+            "oauth:active_provider": "bigmodel",
+            "oauth:zai:user_info": r#"{"id":"ZAI"}"#
+        });
+        assert_eq!(telemetry_user_id(Path::new("zsw-test-home"), &creds), None);
+    }
+
+    #[test]
+    fn telemetry_user_id_decrypts_encrypted_provider_chain() {
+        let home = Path::new("zsw-test-home");
+        let secret = zcrypto::default_secret(home);
+        let prov = zcrypto::encrypt_with_secret("bigmodel", &secret).unwrap();
+        let ui = zcrypto::encrypt_with_secret(r#"{"id":"BM-ENC"}"#, &secret).unwrap();
+        let creds = json!({
+            "oauth:active_provider": prov,
+            "oauth:bigmodel:user_info": ui
+        });
+        assert_eq!(telemetry_user_id(home, &creds), Some("BM-ENC".to_string()));
+    }
+
+    #[test]
+    fn telemetry_user_id_encrypted_provider_undecryptable() {
+        let creds = json!({ "oauth:active_provider": "enc:v1:AAAA.BBBB.CCCC" });
+        assert_eq!(telemetry_user_id(Path::new("zsw-test-home"), &creds), None);
+    }
+
+    #[test]
+    fn activation_body_matches_client_contract() {
+        let b = activation_event_body("app_launch", "ev-1", "u1", "m1");
+        assert_eq!(b["element_name"], json!("app_launch"));
+        assert_eq!(b["user_id"], json!("u1"));
+        assert_eq!(b["device_mid"], json!("m1"));
+        assert_eq!(b["event_id"], json!("ev-1"));
+        assert_eq!(b["mac_id"], json!(""));
+        assert_eq!(b["marketing_params"], json!("{}"));
+        assert!(b["event_extra_detail"].is_object(), "event_extra_detail 必须是对象");
+        assert_eq!(b["event_extra_detail"].as_object().unwrap().len(), 0);
+        assert_eq!(b["client_language"], json!("zh-CN"));
+        assert!(
+            matches!(b["device_os_category"].as_str(), Some("windows") | Some("macos") | Some("linux")),
+            "device_os_category 必须是三值之一"
+        );
+        assert_eq!(b["event_region"], json!("app"));
+        assert_eq!(b["event_type"], json!("view"));
+        assert_eq!(b["event_text"], json!(""));
+    }
+
+    #[test]
+    fn activation_body_differs_per_event() {
+        let a = activation_event_body(
+            ACTIVATION_EVENTS[0],
+            &uuid::Uuid::new_v4().to_string(),
+            "u",
+            "m",
+        );
+        let b = activation_event_body(
+            ACTIVATION_EVENTS[1],
+            &uuid::Uuid::new_v4().to_string(),
+            "u",
+            "m",
+        );
+        assert_ne!(a["element_name"], b["element_name"]);
+        assert_ne!(a["event_id"], b["event_id"]);
+        assert_ne!(
+            (a["element_name"].clone(), a["event_id"].clone()),
+            (b["element_name"].clone(), b["event_id"].clone())
+        );
+        assert_eq!(
+            a["element_name"],
+            json!(ACTIVATION_EVENTS[0])
+        );
+        assert_eq!(
+            b["element_name"],
+            json!(ACTIVATION_EVENTS[1])
+        );
+    }
+
+    #[test]
+    fn device_os_category_matches_consts_os() {
+        let expected = match std::env::consts::OS {
+            "windows" => "windows",
+            "macos" => "macos",
+            _ => "linux",
+        };
+        assert_eq!(device_os_category(), expected);
     }
 }

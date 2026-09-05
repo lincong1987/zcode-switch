@@ -20,6 +20,8 @@ const ICONS = {
 
   gift: P("M2.5 6.5h11") + `<rect x="3.5" y="8" width="9" height="5.5"/>` + P("M8 6.5v7") + P("M8 6.5 6 4.6") + P("M8 6.5 10 4.6"),
 
+  refresh: P("M13.5 8a5.5 5.5 0 1 1-1.6-3.9") + P("M13.5 2.5V6.5h-4"),
+
   userPlus: P("M6 6.8a2.3 2.3 0 1 0 0-4.6 2.3 2.3 0 0 0 0 4.6") + P("M2 13.5v-.9a4 4 0 0 1 8 0v.9") + P("M12 5.5v4") + P("M10 7.5h4"),
 
   play: `<path d="M5 3.2v9.6l8.2-4.8z" fill="currentColor" stroke="none"/>`,
