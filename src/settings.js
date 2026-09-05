@@ -3,16 +3,23 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, lang, stripErr } from "./i18n.js";
+import { stateFingerprint } from "./state-fingerprint.js";
 
 const $app = document.getElementById("app");
 let state = null;
+let stateKey = null;
 let autostart = false;
 let busy = false;
 
 async function refresh() {
-  state = await invoke("get_state");
+  const next = await invoke("get_state");
+  const nextKey = stateFingerprint(next);
+  const changed = nextKey !== stateKey;
+  state = next;
+  stateKey = nextKey;
   autostart = await invoke("autostart_status").catch(() => false);
-  if (state?.language) init(state.language);
+  if (changed && state?.language) init(state.language);
+  return changed;
 }
 
 async function guard(fn) {
@@ -207,7 +214,7 @@ window.onProxyKey = (e) => { if (e.key === "Enter") actions.saveProxy(); };
 installDelegation();
 
 listen("state-changed", () => {
-  refresh().then(render).catch(() => {});
+  refresh().then((changed) => { if (changed) render(); }).catch(() => {});
 });
 
 (async () => {

@@ -46,6 +46,56 @@ pub struct ClaimOutcome {
     pub plan_name: String,
     pub starts_at: Option<i64>,
     pub ends_at: Option<i64>,
+    pub server_time: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimError {
+    pub code: i64,
+    pub message: String,
+    pub next_at: Option<i64>,
+}
+
+impl From<String> for ClaimError {
+    fn from(message: String) -> Self {
+        ClaimError {
+            code: -1,
+            message,
+            next_at: None,
+        }
+    }
+}
+
+fn claim_error(code: i64, body: &Value) -> ClaimError {
+    let next_at = if code == 1005 {
+        body.pointer("/data/plan/ends_at")
+            .and_then(|x| x.as_i64())
+            .map(|s| s * 1000)
+    } else {
+        None
+    };
+    ClaimError {
+        code,
+        message: failure_message(code, body),
+        next_at,
+    }
+}
+
+pub fn failure_payload(
+    account_id: &str,
+    account_name: &str,
+    plan_name: &str,
+    err: &ClaimError,
+) -> Value {
+    serde_json::json!({
+        "ok": false,
+        "accountId": account_id,
+        "accountName": account_name,
+        "planName": plan_name,
+        "code": err.code,
+        "nextAt": err.next_at,
+        "message": err.message,
+    })
 }
 
 fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<String, String> {
@@ -140,9 +190,9 @@ pub fn submit_claim(
     captcha_param: &str,
     captcha_region: Option<&str>,
     device_mid: Option<String>,
-) -> Result<Value, String> {
+) -> Result<Value, ClaimError> {
     if captcha_param.trim().is_empty() {
-        return Err(crate::i18n::tr("err.claim.no_captcha"));
+        return Err(crate::i18n::tr("err.claim.no_captcha").into());
     }
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
@@ -156,13 +206,21 @@ pub fn submit_claim(
     }
     let resp = req
         .send_json(serde_json::json!({ "plan_id": plan_id }))
-        .map_err(|e| http_err(&crate::i18n::tr("err.claim.claim_req"), e))?
+        .map_err(|e| ClaimError {
+            code: -1,
+            message: http_err(&crate::i18n::tr("err.claim.claim_req"), e),
+            next_at: None,
+        })?
         .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
+        .map_err(|e| ClaimError {
+            code: -1,
+            message: crate::i18n::trf("err.http.read", &[("e", &e.to_string())]),
+            next_at: None,
+        })?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
-        return Err(failure_message(code, &v));
+        return Err(claim_error(code, &v));
     }
     Ok(v)
 }
@@ -395,6 +453,7 @@ mod tests {
             plan_name: "p".into(),
             starts_at: Some(1787918400_000),
             ends_at: Some(1788138000_000),
+            server_time: Some(1787800000_000),
         };
         let v = serde_json::to_value(&o).unwrap();
         assert!(v.get("accountId").is_some(), "必须输出 camelCase accountId");
@@ -402,6 +461,53 @@ mod tests {
         assert!(v.get("planName").is_some());
         assert!(v.get("startsAt").is_some());
         assert!(v.get("endsAt").is_some());
+        assert!(v.get("serverTime").is_some(), "3.11.2：server_time 必须随成功载荷下发");
         assert!(v.get("account_id").is_none(), "不得残留 snake_case 键");
+        assert!(v.get("server_time").is_none(), "server_time 同样只出 camelCase");
+    }
+
+    #[test]
+    fn claim_error_extracts_next_at_only_for_1005() {
+        let body = json!({ "code": 1005, "msg": "quota", "data": { "plan": { "ends_at": 1787900000 } } });
+        let e = claim_error(1005, &body);
+        assert_eq!(e.code, 1005);
+        assert_eq!(e.next_at, Some(1787900000_000));
+        assert!(e.message.contains("名额已用完"));
+
+        let e2 = claim_error(1003, &body);
+        assert_eq!(e2.code, 1003);
+        assert_eq!(e2.next_at, None);
+
+        let e3 = claim_error(1005, &json!({ "code": 1005, "msg": "x" }));
+        assert_eq!(e3.next_at, None);
+    }
+
+    #[test]
+    fn from_string_maps_to_code_minus_one() {
+        let e = ClaimError::from("网络炸了".to_string());
+        assert_eq!(e.code, -1);
+        assert_eq!(e.next_at, None);
+        assert_eq!(e.message, "网络炸了");
+        let p = failure_payload("a1", "n", "p", &e);
+        assert_eq!(p["ok"], serde_json::json!(false));
+        assert_eq!(p["code"], serde_json::json!(-1));
+        assert_eq!(p["nextAt"], serde_json::Value::Null);
+        assert_eq!(p["message"], serde_json::json!("网络炸了"));
+    }
+
+    #[test]
+    fn failure_payload_serializes_camel_case() {
+        let e = ClaimError {
+            code: 1005,
+            message: "今日领取名额已用完".into(),
+            next_at: Some(1787900000_000),
+        };
+        let p = failure_payload("a1", "n", "p", &e);
+        for k in ["ok", "accountId", "accountName", "planName", "code", "nextAt", "message"] {
+            assert!(p.get(k).is_some(), "失败载荷缺 {k}");
+        }
+        assert!(p.get("account_id").is_none(), "不得残留 snake_case 键");
+        assert!(p.get("next_at").is_none());
+        assert_eq!(p["nextAt"], serde_json::json!(1787900000_000i64));
     }
 }

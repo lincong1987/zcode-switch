@@ -77,6 +77,7 @@ export const zh = {
   "m.autoClaimFailed": "「{name}」自动领取失败：{msg}",
   "m.autoClaimTimeout": "「{name}」自动领取验证超时，30 分钟内不再自动重试",
   "m.autoClaimBusy": "自动领取进行中，请稍候",
+  "m.claimNextAt": "，{time} 后可再领",
   "m.unknownErr": "未知错误",
   "m.oauthFail": "添加账号失败：{err}",
   "m.oauthDup": "该登录已在账号库中：「{name}」",

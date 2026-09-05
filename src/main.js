@@ -3,15 +3,18 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
+import { stateFingerprint } from "./state-fingerprint.js";
 
 const $app = document.getElementById("app");
 let state = null;
+let stateKey = null;
 let renaming = null;
 let busy = false;
 let acctQuota = {};
 let claimable = {};
 let claimAllRunning = false;
 let modelConfigs = [];
+let modelConfigsKey = null;
 let selectedModelFile = "";
 let modelConfigsBusy = false;
 
@@ -78,17 +81,27 @@ function statRowHtml(s) {
 }
 
 async function refresh() {
-  state = await invoke("get_state");
-  if (state?.language) init(state.language);
+  const next = await invoke("get_state");
+  const nextKey = stateFingerprint(next);
+  const changed = nextKey !== stateKey;
+  state = next;
+  stateKey = nextKey;
+  if (changed && state?.language) init(state.language);
+  return changed;
 }
 
 async function refreshModelConfigs() {
   modelConfigsBusy = true;
   try {
-    modelConfigs = await invoke("model_config_list");
+    const next = await invoke("model_config_list");
+    const nextKey = stateFingerprint(next);
+    const changed = nextKey !== modelConfigsKey;
+    modelConfigs = next;
+    modelConfigsKey = nextKey;
     if (!modelConfigs.some((x) => x.file === selectedModelFile)) {
       selectedModelFile = modelConfigs[0]?.file || "";
     }
+    return changed;
   } finally {
     modelConfigsBusy = false;
   }
@@ -773,10 +786,15 @@ listen("claim://result", (ev) => {
   const isAuto = autoClaimFor != null && autoClaimFor === p.accountId;
   if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
   if (p.ok === false) {
-    toast(t(isAuto ? "m.autoClaimFailed" : "m.claimFailed", { name: p.accountName, msg: p.message || t("m.unknownErr") }), "err");
+    let msg = p.message || t("m.unknownErr");
+    if (p.code === 1005 && p.nextAt) {
+      msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
+    }
+    toast(t(isAuto ? "m.autoClaimFailed" : "m.claimFailed", { name: p.accountName, msg }), "err");
   } else {
     const bits = [];
-    if (p.startsAt) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
+    const now = p.serverTime || Date.now();
+    if (p.startsAt && p.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
     if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
     toast(t(isAuto ? "m.autoClaimOk" : "m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
   }
@@ -802,9 +820,11 @@ listen("oauth://done", (ev) => {
 });
 
 listen("state-changed", () => {
-  refresh().then(async () => {
-    await refreshModelConfigs();
-    if (!uiLocked()) render();
+  Promise.all([refresh(), refreshModelConfigs()]).then(([stateChanged, configsChanged]) => {
+    if (stateChanged || configsChanged) {
+      enrollAccounts();
+      if (!uiLocked()) render();
+    }
   }).catch(() => {});
 });
 
@@ -864,10 +884,8 @@ async function sweepTick() {
     enrollAccounts();
     sweepTick();
     setInterval(() => {
-      invoke("get_state").then(async (s) => {
-        state = s;
-        if (s?.language) init(s.language);
-        await refreshModelConfigs();
+      Promise.all([refresh(), refreshModelConfigs()]).then(([stateChanged, configsChanged]) => {
+        if (!stateChanged && !configsChanged) return;
         enrollAccounts();
         if (!uiLocked()) render();
       }).catch(() => {});

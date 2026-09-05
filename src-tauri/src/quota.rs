@@ -20,7 +20,7 @@ fn no_window(prog: &str) -> std::process::Command {
 pub const QUOTA_LIMIT_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
 pub const SUBSCRIPTION_URL: &str = "https://open.bigmodel.cn/api/biz/subscription/list";
 pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
-pub const CLIENT_APP_VERSION: &str = "3.10.1";
+pub const CLIENT_APP_VERSION: &str = "3.11.2";
 
 pub(crate) fn client_platform() -> String {
     let os = crate::zcrypto::node_platform_for(std::env::consts::OS);
@@ -168,7 +168,16 @@ pub(crate) fn zai_billing_headers(token: &str) -> Vec<(String, String)> {
 }
 
 pub(crate) fn zai_billing_headers_with_mid(token: &str, mid: Option<String>) -> Vec<(String, String)> {
-    let ver = zcode_app_version();
+    zai_headers_with_version(zcode_app_version(), token, mid)
+}
+
+pub(crate) struct OAuthFlowHeaders(pub Vec<(String, String)>);
+
+pub(crate) fn zai_oauth_headers_with_mid(token: &str, mid: Option<String>) -> OAuthFlowHeaders {
+    OAuthFlowHeaders(zai_headers_with_version(CLIENT_APP_VERSION.to_string(), token, mid))
+}
+
+fn zai_headers_with_version(ver: String, token: &str, mid: Option<String>) -> Vec<(String, String)> {
     let mut h: Vec<(String, String)> = vec![
         ("User-Agent".into(), format!("ZCode/{ver}")),
         ("HTTP-Referer".into(), ZCODE_ORIGIN.into()),

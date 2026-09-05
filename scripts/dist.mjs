@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -20,6 +20,13 @@ if (uniq.length !== 1) {
   fail(`版本号不一致：${Object.entries(versions).map(([k, v]) => `${k}=${v}`).join("  ")}`);
 }
 const ver = uniq[0];
+const binaryName = conf.mainBinaryName || pkg.name;
+const artifactStem = conf.productName || pkg.name;
+const configuredTargetDir = process.env.CARGO_TARGET_DIR;
+const targetDir = configuredTargetDir
+  ? (isAbsolute(configuredTargetDir) ? configuredTargetDir : resolve(root, configuredTargetDir))
+  : join(root, "src-tauri", "target");
+const releaseDir = join(targetDir, "release");
 console.log(`[dist] ✓ 版本一致：v${ver}`);
 
 console.log("[dist] npm run tauri build …");
@@ -29,7 +36,7 @@ try {
   fail("构建失败（若是 os error 32：旧实例还在托盘驻留锁住了 exe，退出后重试）");
 }
 
-const bundleDir = join(root, "src-tauri/target/release/bundle/nsis");
+const bundleDir = join(releaseDir, "bundle", "nsis");
 if (!existsSync(bundleDir)) fail(`找不到打包目录：${bundleDir}`);
 const setups = readdirSync(bundleDir)
   .filter((f) => f.endsWith("-setup.exe"))
@@ -41,13 +48,13 @@ if (!setup.includes(`_${ver}_`)) {
   fail(`最新安装包 ${setup} 不含当前版本 ${ver} —— 本次构建可能未产出 NSIS 包，请检查上方构建日志`);
 }
 
-const rawExe = join(root, "src-tauri/target/release/zcode-switch.exe");
+const rawExe = join(releaseDir, `${binaryName}.exe`);
 if (!existsSync(rawExe)) fail(`找不到裸 exe：${rawExe}`);
 
 const outDir = join(root, "release");
 mkdirSync(outDir, { recursive: true });
 const setupDst = join(outDir, setup);
-const portableDst = join(outDir, `zcode-switch_${ver}_portable.exe`);
+const portableDst = join(outDir, `${artifactStem}_${ver}_portable.exe`);
 copyFileSync(join(bundleDir, setup), setupDst);
 copyFileSync(rawExe, portableDst);
 

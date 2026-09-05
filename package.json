@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "dist": "node scripts/dist.mjs",
+    "test": "node --test",
     "check:i18n": "node scripts/check-i18n-keys.mjs"
   },
   "dependencies": {

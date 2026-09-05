@@ -77,6 +77,7 @@ export const en = {
   "m.autoClaimFailed": "Auto-claim failed for \"{name}\": {msg}",
   "m.autoClaimTimeout": "Auto-claim verification timed out for \"{name}\" — retries paused for 30 minutes",
   "m.autoClaimBusy": "Auto-claim in progress — please wait",
+  "m.claimNextAt": " — available again after {time}",
   "m.unknownErr": "Unknown error",
   "m.oauthFail": "Failed to add account: {err}",
   "m.oauthDup": "This login is already in the store: \"{name}\"",

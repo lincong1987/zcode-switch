@@ -22,7 +22,7 @@ pub const OAUTH_PROVIDERS: &[OAuthProvider] = &[
 const REDIRECT_ENC: &str = "zcode%3A%2F%2Foauth%2Fcallback";
 
 pub fn bridge_redirect_uri() -> String {
-    format!("https://zcode.z.ai/app/oauth/login?redirect={REDIRECT_ENC}&app_version={}", quota::zcode_app_version())
+    format!("https://zcode.z.ai/app/oauth/login?redirect={REDIRECT_ENC}&app_version={}", quota::CLIENT_APP_VERSION)
 }
 
 fn urlencode(s: &str) -> String {
@@ -60,7 +60,7 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
         .timeout(Duration::from_secs(20))
         .build();
     let mut req = agent.post(url);
-    for (k, v) in quota::zai_billing_headers_with_mid(&poll_token, Some(mid.to_string())) {
+    for (k, v) in quota::zai_oauth_headers_with_mid(&poll_token, Some(mid.to_string())).0 {
         req = req.set(&k, &v);
     }
     let resp = req
@@ -142,7 +142,7 @@ pub enum PollOutcome {
 pub fn poll_flow_once(url: &str, poll_token: &str, mid: &str) -> Result<PollOutcome, String> {
     let agent = web_agent();
     let mut req = agent.get(url);
-    for (k, v) in quota::zai_billing_headers_with_mid(poll_token, Some(mid.to_string())) {
+    for (k, v) in quota::zai_oauth_headers_with_mid(poll_token, Some(mid.to_string())).0 {
         req = req.set(&k, &v);
     }
     let resp = match req.call() {
@@ -317,7 +317,7 @@ pub fn exchange_token(provider: &str, code: &str, state: &str, mid: &str) -> Res
         .timeout(Duration::from_secs(20))
         .build();
     let mut req = agent.post(TOKEN_URL);
-    for (k, v) in quota::zai_billing_headers_with_mid("", Some(mid.to_string())) {
+    for (k, v) in quota::zai_oauth_headers_with_mid("", Some(mid.to_string())).0 {
         if k == "Authorization" {
             continue;
         }
@@ -689,7 +689,24 @@ mod tests {
         let b = bridge_redirect_uri();
         assert!(b.starts_with("https://zcode.z.ai/app/oauth/login?redirect="), "{b}");
         assert!(b.contains("zcode%3A%2F%2Foauth%2Fcallback"), "深链须编码：{b}");
-        assert!(b.contains("&app_version="), "{b}");
+        assert_eq!(
+            b, format!("https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback&app_version={}", quota::CLIENT_APP_VERSION),
+            "app_version 恒取官方当前版：{b}"
+        );
+    }
+
+    #[test]
+    fn oauth_flow_headers_pin_official_version() {
+        for h in quota::zai_oauth_headers_with_mid("PT", Some("MID".into())).0 {
+            let (k, v) = (h.0.as_str(), h.1.as_str());
+            match k {
+                "User-Agent" => assert_eq!(v, format!("ZCode/{}", quota::CLIENT_APP_VERSION), "{k}"),
+                "X-ZCode-App-Version" => assert_eq!(v, quota::CLIENT_APP_VERSION, "{k}"),
+                "X-Device-Mid" => assert_eq!(v, "MID", "{k}"),
+                "Authorization" => assert_eq!(v, "Bearer PT", "{k}"),
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -884,8 +901,8 @@ mod tests {
                     }
                 }
                 let head = String::from_utf8_lossy(&buf).to_string();
+                let _ = tx.send(head.clone());
                 let line = head.lines().next().unwrap_or_default().to_string();
-                let _ = tx.send(line.clone());
                 if !line.starts_with(route) {
                     let _ = stream.write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -1006,8 +1023,12 @@ mod tests {
         assert!(f.authorize_url.contains("state=cafe01"), "{}", f.authorize_url);
         assert!(f.expires_at_ms > 0);
         assert_eq!(f.poll_interval_ms, 3000);
-        let line = rx.recv().unwrap();
-        assert!(line.starts_with("POST /api/v1/oauth/cli/init"));
+        let head = rx.recv().unwrap();
+        assert!(head.starts_with("POST /api/v1/oauth/cli/init"));
+        assert!(head.contains(&format!("X-ZCode-App-Version: {}", quota::CLIENT_APP_VERSION)), "{head}");
+        assert!(head.contains(&format!("User-Agent: ZCode/{}", quota::CLIENT_APP_VERSION)), "{head}");
+        assert!(head.contains("Authorization: Bearer "), "{head}");
+        assert!(head.contains("X-Device-Mid: MID"), "{head}");
 
         let init_body = json!({
             "code": 0,
@@ -1075,7 +1096,10 @@ mod tests {
             }
             other => panic!("ready 应出 Ready：{other:?}"),
         }
-        assert!(rx2.recv().unwrap().starts_with("GET /poll"));
+        let head2 = rx2.recv().unwrap();
+        assert!(head2.starts_with("GET /poll"));
+        assert!(head2.contains(&format!("X-ZCode-App-Version: {}", quota::CLIENT_APP_VERSION)), "{head2}");
+        assert!(head2.contains(&format!("User-Agent: ZCode/{}", quota::CLIENT_APP_VERSION)), "{head2}");
         let ready_bm = json!({ "code": 0, "data": {
             "status": "ready", "token": "J",
             "user": { "user_id": "U" },
