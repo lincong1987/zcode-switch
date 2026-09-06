@@ -113,11 +113,6 @@ input:focus-visible,
   font-size: 17px;
   letter-spacing: .18em;
   color: var(--ink);
-.wordmark {
-  font-family: var(--mono);
-  font-size: 17px;
-  letter-spacing: .18em;
-  color: var(--ink);
   font-weight: 700;
   white-space: nowrap;
 }
