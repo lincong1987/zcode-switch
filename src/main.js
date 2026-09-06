@@ -10,6 +10,7 @@ let state = null;
 let stateKey = null;
 let renaming = null;
 let busy = false;
+let appVer = "";
 let acctQuota = {};
 let claimable = {};
 let claimAllRunning = false;
@@ -17,6 +18,9 @@ let modelConfigs = [];
 let modelConfigsKey = null;
 let selectedModelFile = "";
 let modelConfigsBusy = false;
+const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
+let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
+let refreshTicker = null;
 
 const NOTCH_COLORS = ["var(--notch-1)", "var(--notch-2)", "var(--notch-3)", "var(--notch-4)", "var(--notch-5)", "var(--notch-6)"];
 function notchColor(id) {
@@ -397,7 +401,7 @@ const actions = {
   },
 
   async claim(id) {
-    if (claimAllRunning) { toast(t("m.claimBusy"), "warn"); return; }
+    if (claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
     if (autoClaimBusy) { toast(t("m.autoClaimBusy"), "warn"); return; }
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
@@ -417,7 +421,7 @@ const actions = {
       .map((a) => a.id)
       .filter((id) => (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
-    if (claimAllRunning) return;
+    if (claimAllRunning || refreshClaim.running) return;
     if (autoClaimBusy) { toast(t("m.autoClaimBusy"), "warn"); return; }
     claimAllRunning = true;
     try {
@@ -442,7 +446,62 @@ const actions = {
       claimAllRunning = false;
     }
   },
+
+  async refreshClaim() {
+    const ids = (state?.accounts || []).map((a) => a.id);
+    if (!ids.length) return;
+    const now = Date.now();
+    if (refreshClaim.running || claimAllRunning) return;
+    if (now < refreshClaim.cooldownUntil) {
+      toast(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - now) / 1000) }), "warn");
+      return;
+    }
+    refreshClaim = { running: true, done: 0, total: ids.length, cooldownUntil: 0 };
+    startRefreshTicker();
+    let okCount = 0;
+    try {
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        const name = state.accounts.find((a) => a.id === id)?.name || id;
+        refreshClaim.done = i + 1;
+        claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
+        if (!uiLocked()) render();
+        try {
+          const r = await invoke("claim_refresh", { id });
+          claimable[id] = { plans: r.plans || [], err: null, busy: false };
+          if ((r.plans || []).length) okCount++;
+          if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
+        } catch (e) {
+          claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
+          toast(t("m.refreshClaimAcctErr", { name, err: stripErr(e) }), "err");
+        }
+        scheduleNext(id);
+        if (!uiLocked()) render();
+        if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 5000));
+      }
+    } finally {
+      refreshClaim.running = false;
+      refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
+      if (!uiLocked()) render();
+      setTimeout(stopRefreshTickerIfIdle, 1100);
+    }
+    toast(t("m.refreshClaimDone", { n: ids.length, k: okCount }), "ok");
+  },
 };
+
+function startRefreshTicker() {
+  if (refreshTicker) return;
+  refreshTicker = setInterval(() => {
+    if (!uiLocked()) render();
+    stopRefreshTickerIfIdle();
+  }, 1000);
+}
+function stopRefreshTickerIfIdle() {
+  const cooling = Date.now() < refreshClaim.cooldownUntil;
+  if (!refreshClaim.running && !cooling && refreshTicker) {
+    clearInterval(refreshTicker); refreshTicker = null; if (!uiLocked()) render();
+  }
+}
 
 function quotaBarHtml(pct) {
   const used = pct == null ? null : Math.min(100, Math.max(0, pct));
@@ -553,7 +612,7 @@ function claimStripHtml(id) {
     ${ic("gift", 15)}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
   </div>`;
 }
 
@@ -696,7 +755,7 @@ function render() {
       <div class="row-top">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}</div>
+          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-actions">
@@ -725,7 +784,7 @@ function render() {
 
   $app.innerHTML = `
     <header class="topbar">
-      <div class="wordmark">Z·SWITCH</div>
+      <div class="wordmark">Z·SWITCH${appVer ? ` <span class="ver">v${esc(appVer)}</span>` : ""}</div>
       <div class="top-status${unsaved ? " unsaved" : ""}">
         <span class="status-dot ${dotCls}"></span>
         <span class="status-text">${esc(statusText)}</span>
@@ -738,8 +797,19 @@ function render() {
         ${ic("capture", 16)} ${t("btn.saveLogin")}
       </button>
       ${claimableCount > 0
-        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning ? "disabled" : ""}
+        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running ? "disabled" : ""}
             title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
+        : ""}
+      ${(s.accounts.length > 0)
+        ? `<button class="btn-ghost has-ic" click="actions.refreshClaim()"
+            ${refreshClaim.running || claimAllRunning || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
+            title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
+              ? esc(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) }))
+              : esc(t("btn.refreshClaimTitle"))}">
+            ${ic("refresh", 16)} ${refreshClaim.running
+              ? esc(t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total }))
+              : esc(t("btn.refreshClaim"))}
+          </button>`
         : ""}
       <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
       <label class="model-config-picker">
@@ -808,6 +878,10 @@ listen("claim://result", (ev) => {
 listen("oauth://done", (ev) => {
   const p = ev.payload || {};
   if (p.ok === false) {
+    if (p.soft) {
+      toast(t("m.oauthSoft", { err: p.error || t("m.unknownErr") }), "warn", t("m.oauthSoftDetail"));
+      return;
+    }
     toast(t("m.oauthFail", { err: p.error || t("m.unknownErr") }), "err");
     return;
   }
@@ -876,6 +950,7 @@ async function sweepTick() {
 
 (async () => {
   try {
+    appVer = await invoke("app_version").catch(() => "");
     await refresh();
     await refreshModelConfigs();
     render();

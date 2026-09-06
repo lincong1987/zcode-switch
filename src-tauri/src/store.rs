@@ -135,6 +135,7 @@ pub struct AccountSummary {
     pub updated_at: String,
     pub is_active: bool,
     pub has_config: bool,
+    pub has_user_info: bool,
     pub identity: zcrypto::Identity,
 }
 
@@ -199,8 +200,21 @@ pub fn now_ts() -> String {
     Local::now().format("%Y-%m-%d %H:%M").to_string()
 }
 
+const DEVICE_KEY_PREFIX: &str = "web-remote-control:";
+
 pub fn canonical_hash(v: &Value) -> String {
-    let bytes = serde_json::to_vec(v).unwrap_or_default();
+    let filtered = match v.as_object() {
+        Some(map) if map.keys().any(|k| k.starts_with(DEVICE_KEY_PREFIX)) => {
+            let kept: serde_json::Map<String, Value> = map
+                .iter()
+                .filter(|(k, _)| !k.starts_with(DEVICE_KEY_PREFIX))
+                .map(|(k, val)| (k.clone(), val.clone()))
+                .collect();
+            Value::Object(kept)
+        }
+        _ => v.clone(),
+    };
+    let bytes = serde_json::to_vec(&filtered).unwrap_or_default();
     let d = Sha256::digest(&bytes);
     format!("{d:x}")
 }
@@ -551,19 +565,36 @@ pub fn client_path_candidates(os: &str) -> Vec<String> {
     }
 }
 
-pub fn effective_zcode_path(paths: &Paths) -> (String, bool) {
-    let s = load_settings(paths);
-    if let Some(p) = s.zcode_path {
-        let ok = PathBuf::from(&p).exists();
-        return (p, ok);
+pub fn normalize_zcode_path(raw: &str) -> Option<String> {
+    let mut t = raw.trim();
+    if t.len() >= 2 {
+        let b = t.as_bytes();
+        let quoted = (b[0] == b'"' && b[t.len() - 1] == b'"') || (b[0] == b'\'' && b[t.len() - 1] == b'\'');
+        if quoted {
+            t = t[1..t.len() - 1].trim();
+        }
     }
-    let candidates = client_path_candidates(std::env::consts::OS);
-    for c in &candidates {
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+pub fn effective_zcode_path(paths: &Paths) -> (String, bool) {
+    effective_zcode_path_in(paths, &client_path_candidates(std::env::consts::OS))
+}
+
+fn effective_zcode_path_in(paths: &Paths, candidates: &[String]) -> (String, bool) {
+    let s = load_settings(paths);
+    if let Some(p) = s.zcode_path.as_ref().filter(|p| PathBuf::from(p).exists()) {
+        return (p.clone(), true);
+    }
+    for c in candidates {
         if !c.is_empty() && PathBuf::from(c).exists() {
             return (c.clone(), true);
         }
     }
-    (candidates[0].clone(), false)
+    if let Some(p) = s.zcode_path {
+        return (p, false);
+    }
+    (candidates.first().cloned().unwrap_or_default(), false)
 }
 
 pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
@@ -579,7 +610,8 @@ pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
             continue;
         }
         if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(a) = serde_json::from_str::<Account>(&raw) {
+            if let Ok(mut a) = serde_json::from_str::<Account>(&raw) {
+                migrate_account_hash_inplace(&mut a);
                 out.push(a);
             }
         }
@@ -601,7 +633,16 @@ pub fn load_account(paths: &Paths, id: &str) -> Result<Account, String> {
     }
     let path = paths.accounts_dir().join(format!("{id}.json"));
     let raw = fs::read_to_string(&path).map_err(|_| trf("err.store.no_account_id", &[("id", id)]))?;
-    serde_json::from_str(&raw).map_err(|e| trf("err.store.corrupt", &[("e", &e.to_string())]))
+    let mut a: Account = serde_json::from_str(&raw).map_err(|e| trf("err.store.corrupt", &[("e", &e.to_string())]))?;
+    migrate_account_hash_inplace(&mut a);
+    Ok(a)
+}
+
+fn migrate_account_hash_inplace(acc: &mut Account) {
+    let want = canonical_hash(&acc.credentials);
+    if want != acc.hash {
+        acc.hash = want;
+    }
 }
 
 fn name_exists(accounts: &[Account], name: &str) -> bool {
@@ -882,7 +923,9 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         }
         let accounts = list_accounts(paths)?;
         let preserved_as = auto_preserve(paths, &accounts, &target.hash)?;
-        hot_swap_verified(paths, &target)?;
+        let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
+        hot_swap_verified(paths, &target, &creds)?;
+        backfill_relay_pass_hash(paths, &target.id, &creds);
         reset_live_plan_cache(paths);
         let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
         write_live_device_mid(paths, &mid)?;
@@ -917,7 +960,9 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
 
     let preserved_as = auto_preserve(paths, &accounts, &target.hash)?;
 
-    write_live(paths, &target.credentials)?;
+    let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
+    write_live(paths, &creds)?;
+    backfill_relay_pass_hash(paths, &target.id, &creds);
     if let Some(cfg) = &target.config {
         write_live_config(paths, cfg)?;
     }
@@ -949,7 +994,36 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     })
 }
 
-fn hot_swap_verified(paths: &Paths, target: &Account) -> Result<(), String> {
+const RELAY_PASS_KEY: &str = "web-remote-control:external-relay:pass_hash";
+
+fn inject_relay_pass_hash(creds: &Value, relay: Option<&Value>) -> Value {
+    let Some(relay) = relay else { return creds.clone() };
+    let mut out = creds.clone();
+    if let Some(map) = out.as_object_mut() {
+        map.insert(RELAY_PASS_KEY.to_string(), relay.clone());
+    }
+    out
+}
+
+fn current_relay_pass(paths: &Paths) -> Option<Value> {
+    read_live(paths)
+        .ok()
+        .flatten()
+        .and_then(|v| v.get(RELAY_PASS_KEY).cloned())
+}
+
+fn backfill_relay_pass_hash(paths: &Paths, target_id: &str, creds: &Value) {
+    let Ok(mut acc) = load_account(paths, target_id) else { return };
+    if acc.credentials != *creds {
+        acc.credentials = creds.clone();
+        acc.updated_at = now_ts();
+        if let Err(e) = save_account(paths, &acc) {
+            eprintln!("relay 回填失败(不阻断切换): {e}");
+        }
+    }
+}
+
+fn hot_swap_verified(paths: &Paths, target: &Account, creds: &Value) -> Result<(), String> {
     let want = zcrypto::account_identity(&target.credentials, &paths.home);
     let use_hash = !identity_has_signal(&want);
     let verify = |v: &Value| {
@@ -962,7 +1036,7 @@ fn hot_swap_verified(paths: &Paths, target: &Account) -> Result<(), String> {
     let mut last_err: Option<String> = None;
     let backoff = |attempt: u32| std::thread::sleep(std::time::Duration::from_millis(250 + u64::from(attempt) * 250));
     for attempt in 0..3u32 {
-        if let Err(e) = write_live(paths, &target.credentials) {
+        if let Err(e) = write_live(paths, creds) {
             last_err = Some(trf("err.write", &[("e", &e)]));
             backoff(attempt);
             continue;
@@ -1462,6 +1536,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
             updated_at: a.updated_at.clone(),
             is_active: live_hash.as_deref() == Some(a.hash.as_str()),
             has_config: a.config.is_some(),
+            has_user_info: crate::claim::telemetry_user_id(&paths.home, &a.credentials).is_some(),
             identity: zcrypto::account_identity(&a.credentials, &paths.home),
         })
         .collect();
@@ -1525,6 +1600,65 @@ mod tests {
         }}});
         fs::write(home.join(".zcode/v2/config.json"), serde_json::to_string(&v).unwrap()).unwrap();
         v
+    }
+
+    #[test]
+    fn canonical_hash_excludes_device_level_keys() {
+        assert!(RELAY_PASS_KEY.starts_with(DEVICE_KEY_PREFIX), "relay 键必须落在设备级命名空间内");
+        let base = json!({
+            "zcodejwttoken": "J",
+            "web-remote-control:external-relay:pass_hash": "enc:v1:A",
+        });
+        let rotated = json!({
+            "zcodejwttoken": "J",
+            "web-remote-control:external-relay:pass_hash": "enc:v1:B",
+        });
+        let none = json!({ "zcodejwttoken": "J" });
+        assert_eq!(canonical_hash(&base), canonical_hash(&rotated));
+        assert_eq!(canonical_hash(&base), canonical_hash(&none));
+        let other = json!({ "zcodejwttoken": "J2", "web-remote-control:external-relay:pass_hash": "enc:v1:A" });
+        assert_ne!(canonical_hash(&base), canonical_hash(&other));
+    }
+
+    #[test]
+    fn legacy_full_tree_hash_migrated_on_load() {
+        let home = fake_home("hashmig");
+        let p = Paths::new(&home);
+        let mut legacy = Account {
+            id: Uuid::new_v4().to_string(),
+            name: "旧口径账号".into(),
+            created_at: now_ts(),
+            updated_at: "2000-01-01 00:00".into(),
+            hash: String::new(),
+            credentials: json!({
+                "zcodejwttoken": "enc:v1:JJJ",
+                "web-remote-control:external-relay:pass_hash": "enc:v1:OLDRELAY",
+            }),
+            config: None,
+            virtual_device_mid: None,
+            virtual_arms_uid: None,
+        };
+        let full = Sha256::digest(serde_json::to_vec(&legacy.credentials).unwrap());
+        legacy.hash = format!("{full:x}");
+        let legacy_full_tree_hash_as_saved = legacy.hash.clone();
+        assert_ne!(legacy.hash, canonical_hash(&legacy.credentials), "前置:新旧口径必须不同");
+        save_account(&p, &legacy).unwrap();
+
+        let listed = list_accounts(&p).unwrap();
+        let got = listed.iter().find(|a| a.id == legacy.id).unwrap();
+        assert_eq!(got.hash, canonical_hash(&got.credentials), "读出即迁移到新口径");
+        assert_eq!(got.updated_at, "2000-01-01 00:00", "迁移不得动 updated_at");
+        let reloaded = load_account(&p, &legacy.id).unwrap();
+        assert_eq!(reloaded.hash, canonical_hash(&reloaded.credentials), "重读仍给出迁移后内存值");
+        let raw: Value = serde_json::from_str(&fs::read_to_string(p.accounts_dir().join(format!("{}.json", legacy.id))).unwrap()).unwrap();
+        assert_eq!(raw["hash"].as_str(), Some(legacy_full_tree_hash_as_saved.as_str()), "读路径不落盘:盘上保持旧口径,由下次真实 save 收敛");
+
+        let mut live = legacy.credentials.clone();
+        live["web-remote-control:external-relay:pass_hash"] = json!("enc:v1:NEWRELAY");
+        fs::write(p.live_file(), serde_json::to_string(&live).unwrap()).unwrap();
+        let st = get_state(&p).unwrap();
+        assert_eq!(st.active_account_id.as_deref(), Some(legacy.id.as_str()), "设备键轮换不再打断当前账号识别");
+        assert!(st.accounts.iter().find(|a| a.id == legacy.id).unwrap().is_active);
     }
 
     #[test]
@@ -2320,9 +2454,160 @@ mod tests {
         write_live_raw(&home, "other");
         let before_hash = canonical_hash(&read_live(&paths).unwrap().unwrap());
         assert_ne!(before_hash, target.hash);
-        hot_swap_verified(&paths, &target).unwrap();
+        hot_swap_verified(&paths, &target, &target.credentials).unwrap();
         let after = read_live(&paths).unwrap().unwrap();
         assert_eq!(canonical_hash(&after), target.hash, "热切换后 live 即目标账号");
+    }
+
+    #[test]
+    fn switch_preserves_relay_pass_hash_and_backfills_snapshot() {
+        let home = fake_home("relaykeep");
+        let p = Paths::new(&home);
+        let mut live = write_live_raw(&home, "S1");
+        live[RELAY_PASS_KEY] = json!("enc:v1:RELAY-LIVE");
+        fs::write(p.live_file(), serde_json::to_string(&live).unwrap()).unwrap();
+        capture_current(&p, Some("源号".into())).unwrap();
+        let mut target = Account {
+            id: Uuid::new_v4().to_string(),
+            name: "目标号".into(),
+            created_at: now_ts(),
+            updated_at: "2000-01-01 00:00".into(),
+            hash: String::new(),
+            credentials: write_live_raw(&home, "T1"),
+            config: None,
+            virtual_device_mid: None,
+            virtual_arms_uid: None,
+        };
+        target.hash = canonical_hash(&target.credentials);
+        save_account(&p, &target).unwrap();
+        fs::write(p.live_file(), serde_json::to_string(&live).unwrap()).unwrap();
+
+        switch_to(&p, &target.id, true, false, false).unwrap();
+
+        let after = read_live(&p).unwrap().unwrap();
+        assert_eq!(after[RELAY_PASS_KEY].as_str(), Some("enc:v1:RELAY-LIVE"), "切换后 live 保留机器当前 relay 密钥");
+        assert_eq!(after["oauth:bigmodel:access_token"], json!("enc:v1:AAAT1"), "账号凭证确实是目标号");
+        let snap = load_account(&p, &target.id).unwrap();
+        assert_eq!(snap.credentials[RELAY_PASS_KEY].as_str(), Some("enc:v1:RELAY-LIVE"), "快照被回填");
+        assert_ne!(snap.updated_at, "2000-01-01 00:00", "回填递增 updated_at");
+    }
+
+    #[test]
+    fn switch_does_not_mint_relay_key_when_live_lacks_it() {
+        let home = fake_home("relaynomint");
+        let p = Paths::new(&home);
+        write_live_raw(&home, "S1");
+        capture_current(&p, Some("源号".into())).unwrap();
+        let mut target = Account {
+            id: Uuid::new_v4().to_string(),
+            name: "目标号".into(),
+            created_at: now_ts(),
+            updated_at: "2000-01-01 00:00".into(),
+            hash: String::new(),
+            credentials: write_live_raw(&home, "T1"),
+            config: None,
+            virtual_device_mid: Some(Uuid::new_v4().to_string()),
+            virtual_arms_uid: Some("arms-uid-fixed".into()),
+        };
+        target.hash = canonical_hash(&target.credentials);
+        save_account(&p, &target).unwrap();
+        write_live_raw(&home, "S1");
+
+        switch_to(&p, &target.id, true, false, false).unwrap();
+
+        let after = read_live(&p).unwrap().unwrap();
+        assert!(after.get(RELAY_PASS_KEY).is_none(), "live 无键时绝不代铸");
+        let snap = load_account(&p, &target.id).unwrap();
+        assert!(snap.credentials.get(RELAY_PASS_KEY).is_none(), "快照也不得被塞键");
+        assert_eq!(snap.updated_at, "2000-01-01 00:00", "无注入则无回填,updated_at 不动");
+    }
+
+    #[test]
+    fn hot_swap_verified_accepts_injected_creds() {
+        let home = fake_home("relayhot");
+        let p = Paths::new(&home);
+        let mut live = write_live_raw(&home, "before");
+        live[RELAY_PASS_KEY] = json!("enc:v1:RELAY-LIVE");
+        fs::write(p.live_file(), serde_json::to_string(&live).unwrap()).unwrap();
+        let mut target = Account {
+            id: Uuid::new_v4().to_string(),
+            name: "目标号".into(),
+            created_at: now_ts(),
+            updated_at: now_ts(),
+            hash: String::new(),
+            credentials: write_live_raw(&home, "tgt"),
+            config: None,
+            virtual_device_mid: None,
+            virtual_arms_uid: None,
+        };
+        target.hash = canonical_hash(&target.credentials);
+        save_account(&p, &target).unwrap();
+
+        let creds = inject_relay_pass_hash(&target.credentials, live.get(RELAY_PASS_KEY));
+        hot_swap_verified(&p, &target, &creds).unwrap();
+
+        let after = read_live(&p).unwrap().unwrap();
+        assert_eq!(after[RELAY_PASS_KEY].as_str(), Some("enc:v1:RELAY-LIVE"), "注入键随切换落 live");
+        assert_eq!(canonical_hash(&after), target.hash, "含注入键的 live 哈希校验仍过(排除式哈希自洽)");
+    }
+
+    #[test]
+    fn current_relay_pass_reads_disk_at_call_time_not_capture_time() {
+        let home = fake_home("relayfresh");
+        let p = Paths::new(&home);
+        let mut live = write_live_raw(&home, "S1");
+        live[RELAY_PASS_KEY] = json!("enc:v1:OLD");
+        fs::write(p.live_file(), serde_json::to_string(&live).unwrap()).unwrap();
+
+        let v1 = current_relay_pass(&p);
+        assert_eq!(
+            v1.as_ref().and_then(|v| v.as_str()),
+            Some("enc:v1:OLD"),
+            "读到的必须是盘上当前值"
+        );
+
+        live[RELAY_PASS_KEY] = json!("enc:v1:NEW");
+        fs::write(p.live_file(), serde_json::to_string(&live).unwrap()).unwrap();
+
+        let v2 = current_relay_pass(&p);
+        assert_eq!(
+            v2.as_ref().and_then(|v| v.as_str()),
+            Some("enc:v1:NEW"),
+            "轮换后必须读到新值——入口快照语义则恒为 OLD"
+        );
+    }
+
+    #[test]
+    fn switch_overwrites_stale_relay_key_in_snapshot() {
+        let home = fake_home("relaystale");
+        let p = Paths::new(&home);
+        let mut live = write_live_raw(&home, "S1");
+        live[RELAY_PASS_KEY] = json!("enc:v1:NEWRELAY");
+        fs::write(p.live_file(), serde_json::to_string(&live).unwrap()).unwrap();
+        capture_current(&p, Some("源号".into())).unwrap();
+        let mut target = Account {
+            id: Uuid::new_v4().to_string(),
+            name: "目标号".into(),
+            created_at: now_ts(),
+            updated_at: now_ts(),
+            hash: String::new(),
+            credentials: write_live_raw(&home, "T1"),
+            config: None,
+            virtual_device_mid: Some(Uuid::new_v4().to_string()),
+            virtual_arms_uid: Some("arms-uid-fixed".into()),
+        };
+        target.credentials[RELAY_PASS_KEY] = json!("enc:v1:OLDRELAY");
+        target.hash = canonical_hash(&target.credentials);
+        save_account(&p, &target).unwrap();
+        fs::write(p.live_file(), serde_json::to_string(&live).unwrap()).unwrap();
+
+        switch_to(&p, &target.id, true, false, false).unwrap();
+
+        let after = read_live(&p).unwrap().unwrap();
+        assert_eq!(after[RELAY_PASS_KEY].as_str(), Some("enc:v1:NEWRELAY"), "live 取机器当前值(NEW),不是快照旧值(OLD)");
+        assert_eq!(after["oauth:bigmodel:access_token"], json!("enc:v1:AAAT1"), "账号凭证确实是目标号");
+        let snap = load_account(&p, &target.id).unwrap();
+        assert_eq!(snap.credentials[RELAY_PASS_KEY].as_str(), Some("enc:v1:NEWRELAY"), "快照旧值被覆盖回填");
     }
 
     #[test]
@@ -2338,6 +2623,75 @@ mod tests {
         assert!(!st.close_to_tray);
         let (path, _ok) = effective_zcode_path(&p);
         assert!(!path.is_empty());
+    }
+
+    #[test]
+    fn effective_zcode_path_dangling_saved_falls_back_to_candidate() {
+        let home = fake_home("zpath1");
+        let p = Paths::new(&home);
+        let cand = home.join("installed").join("ZCode.exe");
+        fs::create_dir_all(cand.parent().unwrap()).unwrap();
+        fs::write(&cand, b"stub").unwrap();
+        let mut s = load_settings(&p);
+        s.zcode_path = Some(home.join("gone").join("ZCode.exe").to_string_lossy().to_string());
+        save_settings(&p, &s).unwrap();
+        let (path, ok) = effective_zcode_path_in(&p, &[cand.to_string_lossy().to_string()]);
+        assert!(ok, "悬空保存路径应回落到存在的候选");
+        assert_eq!(path, cand.to_string_lossy());
+    }
+
+    #[test]
+    fn effective_zcode_path_dangling_saved_without_candidate_keeps_saved() {
+        let home = fake_home("zpath2");
+        let p = Paths::new(&home);
+        let mut s = load_settings(&p);
+        let saved = home.join("gone").join("ZCode.exe").to_string_lossy().to_string();
+        s.zcode_path = Some(saved.clone());
+        save_settings(&p, &s).unwrap();
+        let (path, ok) = effective_zcode_path_in(&p, &[home.join("nowhere.exe").to_string_lossy().to_string()]);
+        assert!(!ok);
+        assert_eq!(path, saved);
+    }
+
+    #[test]
+    fn effective_zcode_path_existing_saved_wins_over_candidates() {
+        let home = fake_home("zpath3");
+        let p = Paths::new(&home);
+        let saved = home.join("custom").join("ZCode.exe");
+        fs::create_dir_all(saved.parent().unwrap()).unwrap();
+        fs::write(&saved, b"stub").unwrap();
+        let mut s = load_settings(&p);
+        s.zcode_path = Some(saved.to_string_lossy().to_string());
+        save_settings(&p, &s).unwrap();
+        let cand = home.join("installed").join("ZCode.exe");
+        fs::create_dir_all(cand.parent().unwrap()).unwrap();
+        fs::write(&cand, b"stub").unwrap();
+        let (path, ok) = effective_zcode_path_in(&p, &[cand.to_string_lossy().to_string()]);
+        assert!(ok, "真实存在的保存路径优先于候选");
+        assert_eq!(path, saved.to_string_lossy());
+    }
+
+    #[test]
+    fn zcode_path_empty_input_normalizes_to_none() {
+        assert_eq!(normalize_zcode_path("   "), None);
+        assert_eq!(normalize_zcode_path(""), None);
+        assert_eq!(normalize_zcode_path(" \" \" "), None);
+        assert_eq!(
+            normalize_zcode_path("  C:\\Program Files\\ZCode\\ZCode.exe  "),
+            Some("C:\\Program Files\\ZCode\\ZCode.exe".to_string())
+        );
+        assert_eq!(
+            normalize_zcode_path("\"C:\\Program Files\\ZCode\\ZCode.exe\""),
+            Some("C:\\Program Files\\ZCode\\ZCode.exe".to_string())
+        );
+        assert_eq!(
+            normalize_zcode_path("'C:\\Program Files\\ZCode\\ZCode.exe'"),
+            Some("C:\\Program Files\\ZCode\\ZCode.exe".to_string())
+        );
+        assert_eq!(
+            normalize_zcode_path("\"C:\\Program Files\\ZCode"),
+            Some("\"C:\\Program Files\\ZCode".to_string())
+        );
     }
 
     #[test]

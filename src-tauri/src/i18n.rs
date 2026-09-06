@@ -199,6 +199,7 @@ const ZH: &[(&str, &str)] = &[
     ("err.claim.config_unavailable", "验证码配置不可用"),
     ("err.claim.gone", "该套餐已不可领取，请刷新"),
     ("err.claim.none_pending", "没有待领取的套餐"),
+    ("err.claim.activate_req", "激活上报失败：{e}"),
     ("claim.fail.1001", "套餐不存在"),
     ("claim.fail.1002", "活动已结束或套餐暂不可领取"),
     ("claim.fail.1003", "该套餐已经领取过"),
@@ -365,6 +366,7 @@ const EN: &[(&str, &str)] = &[
     ("err.claim.config_unavailable", "Captcha config unavailable"),
     ("err.claim.gone", "This plan is no longer claimable — refresh the list"),
     ("err.claim.none_pending", "No pending plan to claim"),
+    ("err.claim.activate_req", "Activation report failed: {e}"),
     ("claim.fail.1001", "Plan does not exist"),
     ("claim.fail.1002", "The event has ended or the plan is not claimable yet"),
     ("claim.fail.1003", "This plan has already been claimed"),
@@ -590,5 +592,15 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "i18n key used but not in catalog: {missing:?}");
+    }
+
+    #[test]
+    fn no_locale_value_collides_with_deeplink_sentinels() {
+        for table in [ZH, EN] {
+            for &(_, v) in table {
+                assert_ne!(v, "__superseded__", "i18n 值不得撞深链哨兵 __superseded__");
+                assert_ne!(v, "__attribution__", "i18n 值不得撞深链哨兵 __attribution__");
+            }
+        }
     }
 }

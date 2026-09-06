@@ -33,7 +33,7 @@ pub(crate) fn client_platform() -> String {
 }
 
 const ZCODE_ORIGIN: &str = "https://zcode.z.ai";
-const ZCODE_LANG: &str = "zh-CN";
+pub(crate) const ZCODE_LANG: &str = "zh-CN";
 const ZCODE_CHANNEL: &str = "stable";
 
 pub(crate) fn device_mid() -> Option<String> {
@@ -55,7 +55,7 @@ pub(crate) fn device_mid() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn os_version() -> Option<String> {
+pub(crate) fn os_version() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
@@ -72,7 +72,7 @@ fn os_version() -> Option<String> {
 }
 
 #[cfg(not(windows))]
-fn os_version() -> Option<String> {
+pub(crate) fn os_version() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
@@ -84,7 +84,7 @@ fn os_version() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn client_timezone() -> String {
+pub(crate) fn client_timezone() -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
@@ -106,7 +106,7 @@ fn client_timezone() -> String {
 }
 
 #[cfg(not(windows))]
-fn client_timezone() -> String {
+pub(crate) fn client_timezone() -> String {
     iana_time_zone::get_timezone().unwrap_or_else(|_| "unknown".to_string())
 }
 

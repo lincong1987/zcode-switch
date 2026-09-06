@@ -10,6 +10,7 @@ let state = null;
 let stateKey = null;
 let autostart = false;
 let busy = false;
+let appVer = "";
 
 async function refresh() {
   const next = await invoke("get_state");
@@ -120,9 +121,10 @@ const actions = {
   async savePath() {
     const input = document.querySelector(".settings input.zcode-path:not(.auth-proxy)");
     if (!input) return;
+    const v = input.value.trim();
     await guard(async () => {
-      await invoke("set_zcode_path", { path: input.value.trim() });
-      toast(t("s.pathUpdated"));
+      await invoke("set_zcode_path", { path: v });
+      toast(v ? t("s.pathUpdated") : t("s.pathAuto"));
       await refresh(); render();
     });
   },
@@ -204,7 +206,7 @@ function render() {
         <button class="btn-ghost" click="actions.savePath()">${t("common.save")}</button>
       </div>
       <div class="hint">${t("s.hint")}</div>
-      <div class="gh-row"><a class="gh-link" href="https://github.com/pjpv/zcode-switch" target="_blank" rel="noopener" click="actions.openGitHub()">${t("s.githubLink")}</a></div>
+      <div class="gh-row"><a class="gh-link" href="https://github.com/pjpv/zcode-switch" target="_blank" rel="noopener" click="actions.openGitHub()">${t("s.githubLink")}</a>${appVer ? `<span class="ver">v${esc(appVer)}</span>` : ""}</div>
     </section>`;
 }
 
@@ -219,6 +221,7 @@ listen("state-changed", () => {
 
 (async () => {
   try {
+    appVer = await invoke("app_version").catch(() => "");
     await refresh();
     render();
     dismissSplash();

@@ -155,6 +155,11 @@ async fn get_state() -> Result<AppState, String> {
 }
 
 #[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
 async fn capture_current(app: AppHandle, name: Option<String>) -> Result<Account, String> {
     let _guard = store_guard();
     let r = store::capture_current(&Paths::detect(), name);
@@ -236,6 +241,31 @@ async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
     claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimRefreshResult {
+    plans: Vec<claim::ClaimPlan>,
+    activated: bool,
+    activation_error: Option<String>,
+}
+
+#[tauri::command]
+async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
+    let paths = Paths::detect();
+    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+    let acc = load_account(&paths, &id)?;
+    let (activated, activation_error) =
+        match claim::telemetry_user_id(&paths.home, &acc.credentials) {
+            Some(uid) => match claim::report_activation_events(&uid, &mid) {
+                Ok(()) => (true, None),
+                Err(e) => (false, Some(e)),
+            },
+            None => (false, None),
+        };
+    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))?;
+    Ok(ClaimRefreshResult { plans, activated, activation_error })
 }
 
 #[tauri::command]
@@ -520,7 +550,20 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
         .await
         .unwrap_or_else(|e| Err(i18n::trf("err.oauth.flow", &[("e", &e.to_string())])))
     };
+    if let Err(e) = &result {
+        if deeplink_err_soft(e) {
+            let ours = pending_oauth_guard().as_ref().map(|p| p.flow == flow).unwrap_or(false);
+            if ours {
+                let _ = app.emit("oauth://done", &json!({ "ok": false, "soft": true, "error": e }));
+            }
+            return;
+        }
+    }
     finalize_oauth_result(app, result);
+}
+
+fn deeplink_err_soft(e: &str) -> bool {
+    e != "__superseded__" && e != "__attribution__"
 }
 
 fn persist_oauth_account(
@@ -990,7 +1033,7 @@ async fn set_zcode_path(app: AppHandle, path: String) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
     let mut s = load_settings(&paths);
-    s.zcode_path = Some(path);
+    s.zcode_path = store::normalize_zcode_path(&path);
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);
     let _ = app.emit("state-changed", ());
@@ -1027,6 +1070,7 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             get_state,
+            app_version,
             capture_current,
             rename_account,
             delete_account,
@@ -1038,6 +1082,7 @@ pub fn run() {
             get_live_quota,
             get_account_quota,
             claim_preview,
+            claim_refresh,
             claim_start,
             claim_captcha_config,
             claim_captcha_submit,
@@ -1103,4 +1148,20 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deeplink_err_soft;
+
+    #[test]
+    fn deeplink_soft_failure_classification() {
+        assert!(!deeplink_err_soft("__superseded__"));
+        assert!(!deeplink_err_soft("__attribution__"));
+        assert!(deeplink_err_soft(
+            "token 交换请求失败：https://zcode.z.ai/api/v1/oauth/token: status code 500"
+        ));
+        assert!(deeplink_err_soft("state 不一致"));
+        assert!(deeplink_err_soft(""));
+    }
 }
